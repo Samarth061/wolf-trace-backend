@@ -11,6 +11,7 @@ class Settings(BaseSettings):
 
     gemini_api_key: str = ""
     backboard_api_key: str = ""
+    groq_api_key: str = ""
     neo4j_uri: str = ""
     neo4j_username: str = ""
     neo4j_password: str = ""
@@ -20,6 +21,7 @@ class Settings(BaseSettings):
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = ""
     cors_origins: str = "http://localhost:3000,http://localhost:5173"
+    media_base_url: str = ""
 
     @property
     def cors_origins_list(self) -> list[str]:

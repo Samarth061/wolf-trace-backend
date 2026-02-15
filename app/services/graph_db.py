@@ -62,6 +62,25 @@ class GraphDatabase:
         with db._driver.session() as session:
             yield session
 
+    @classmethod
+    def get_optional_session(cls) -> Generator[Neo4jSession | None, None, None]:
+        """
+        FastAPI dependency: yields Neo4j session if available, None otherwise.
+        Use this for endpoints where Neo4j is optional.
+        """
+        db = cls.get_instance()
+        if not db._driver:
+            logger.debug("Neo4j not configured, yielding None")
+            yield None
+            return
+
+        try:
+            with db._driver.session() as session:
+                yield session
+        except Exception as e:
+            logger.warning(f"Neo4j session failed: {e}")
+            yield None
+
     def close(self) -> None:
         """Shut down the driver. Call on application shutdown."""
         if self._driver:

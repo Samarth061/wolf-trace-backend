@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.event_bus import start_event_bus, stop_event_bus
-from app.routers import reports, cases, alerts, ws, seed
+from app.routers import reports, cases, alerts, ws, seed, files
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,6 +28,8 @@ async def lifespan(app: FastAPI):
             logger.info("Backboard assistants ready: %d", len(assistants))
         except Exception as e:
             logger.warning("Backboard assistants init failed: %s", e)
+    else:
+        logger.info("BACKBOARD_API_KEY not set — forensic analysis will use fallback scores")
 
     # Neo4j AuraDB: connect and verify
     graph_db = GraphDatabase.get_instance()
@@ -68,6 +70,7 @@ app.include_router(cases.router)
 app.include_router(alerts.router)
 app.include_router(ws.router)
 app.include_router(seed.router)
+app.include_router(files.router)
 
 
 @app.get("/health")

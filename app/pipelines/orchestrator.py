@@ -3,7 +3,7 @@ import logging
 from typing import Any
 
 from app.pipelines.blackboard_controller import BlackboardController, Priority
-from app.pipelines import case_synthesizer, classifier, clustering, forensics, forensics_xref, network, recluster_debunk
+from app.pipelines import case_synthesizer, classifier, clustering, forensics, forensics_xref, network
 
 logger = logging.getLogger(__name__)
 
@@ -33,17 +33,25 @@ def register_knowledge_sources() -> BlackboardController:
     async def _forensics_handler(payload: dict[str, Any]) -> None:
         node_id = payload.get("report_node_id") or payload.get("node_id") or payload.get("id", "")
         media_url = payload.get("media_url") or (payload.get("data") or {}).get("media_url")
-        await forensics.run_forensics(payload["case_id"], node_id, media_url)
+        llm_provider = (payload.get("data") or {}).get("llm_provider", "default")  # NEW: Get LLM preference
+        await forensics.run_forensics(
+            payload["case_id"],
+            node_id,
+            media_url,
+            llm_provider=llm_provider  # NEW: Pass to forensics pipeline
+        )
 
     async def _network_handler(payload: dict[str, Any]) -> None:
         node_id = payload.get("report_node_id") or payload.get("node_id") or payload.get("id", "")
         node_data = payload.get("data", payload)
+        llm_provider = payload.get("llm_provider", "default")  # NEW: Get LLM preference from payload
         await network.run_network(
             payload["case_id"],
             node_id,
             node_data.get("text_body", ""),
             location=node_data.get("location"),
             timestamp=node_data.get("timestamp", ""),
+            llm_provider=llm_provider,  # NEW: Pass to network pipeline
         )
 
     def _has_media(p: dict[str, Any]) -> bool:
@@ -92,20 +100,10 @@ def register_knowledge_sources() -> BlackboardController:
             "edge:similar_to",
             "edge:repost_of",
             "edge:mutation_of",
-            "edge:debunked_by",
             "edge:amplified_by",
-            "node:fact_check",
-            "node:external_source",
         ],
         handler=classifier.run_classifier,
         cooldown_seconds=2.0,
-    )
-    ctrl.register(
-        name="recluster_debunk",
-        priority=Priority.HIGH,
-        trigger_types=["edge:debunked_by"],
-        handler=recluster_debunk.run_recluster_debunk,
-        cooldown_seconds=1.0,
     )
     ctrl.register(
         name="case_synthesizer",

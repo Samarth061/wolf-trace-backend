@@ -1,15 +1,21 @@
 """Backboard.io client — 4 specialized AI agents with persistent case threads."""
 import json
 import logging
+import re
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from app.config import settings
+
+UPLOAD_DIR = Path("/tmp/wolftrace-uploads")
 
 logger = logging.getLogger(__name__)
 
 _client = None
 _assistants: dict[str, Any] = {}
 _case_threads: dict[str, dict[str, str]] = {}  # case_id -> {assistant_name: thread_id}
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 CLAIM_ANALYST_INSTRUCTIONS = """You are the Claim Analyst for Shadow Bureau, a campus safety intelligence system.
 
@@ -127,7 +133,9 @@ async def create_case_thread(case_id: str) -> dict[str, str]:
             aid = getattr(assistant, "assistant_id", None) or getattr(assistant, "id", None) or assistant
             if aid:
                 t = await client.create_thread(assistant_id=aid)
-                threads[key] = str(getattr(t, "id", t))
+                tid = _extract_thread_id(t)
+                if tid:
+                    threads[key] = tid
         _case_threads[case_id] = threads
         return threads
     except Exception as e:
@@ -185,7 +193,10 @@ async def recall_memory(assistant_key: str, query: str) -> str:
     if not client or assistant_key not in assistants:
         return ""
     try:
-        resp = await client.get_memories(assistant_id=getattr(assistants[assistant_key], "id", ""))
+        aid = getattr(assistants[assistant_key], "assistant_id", None) or getattr(assistants[assistant_key], "id", None)
+        if not aid:
+            return ""
+        resp = await client.get_memories(assistant_id=aid)
         if hasattr(resp, "memories") and resp.memories:
             relevant = [m.content for m in resp.memories if query.lower() in (m.content or "").lower()]
             return "\n".join(relevant[:5]) if relevant else ""
@@ -202,7 +213,13 @@ def _parse_json(text: str) -> dict[str, Any] | list[Any]:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        pass
+        # Try to recover JSON from mixed content
+        m = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except json.JSONDecodeError:
+                pass
     return {}
 
 
@@ -212,3 +229,278 @@ def get_assistants() -> dict[str, Any]:
 
 def get_thread_ids(case_id: str) -> dict[str, str]:
     return _case_threads.get(case_id, {})
+
+
+def _extract_thread_id(thread: Any) -> str | None:
+    if thread is None:
+        return None
+    if isinstance(thread, str):
+        m = _UUID_RE.search(thread)
+        return m.group(0) if m else (thread if _UUID_RE.fullmatch(thread.strip()) else None)
+    if isinstance(thread, dict):
+        for key in ("id", "thread_id"):
+            val = thread.get(key)
+            if val:
+                s = str(val)
+                if _UUID_RE.fullmatch(s.strip()) and " " not in s:
+                    return s
+        text = str(thread)
+        m = _UUID_RE.search(text)
+        return m.group(0) if m else None
+    for attr in ("thread_id", "id"):
+        val = getattr(thread, attr, None)
+        if val is not None:
+            s = str(val)
+            if "thread_id=" in s or "UUID(" in s or " " in s or "datetime" in s:
+                break
+            if _UUID_RE.fullmatch(s.strip()):
+                return s
+    text = str(thread)
+    m = _UUID_RE.search(text)
+    return m.group(0) if m else None
+
+
+def _resolve_media_to_local_path(media_url: str) -> Path | None:
+    """Resolve media_url to a local filesystem path for Backboard SDK files= parameter.
+
+    Handles:
+    - file:///tmp/wolftrace-uploads/xyz.jpg -> /tmp/wolftrace-uploads/xyz.jpg
+    - http://localhost:8000/api/upload/xyz.jpg -> /tmp/wolftrace-uploads/xyz.jpg
+    - /api/upload/xyz.jpg (relative path) -> /tmp/wolftrace-uploads/xyz.jpg
+
+    Returns None if the path cannot be resolved or the file does not exist.
+    """
+    if not media_url:
+        return None
+    url = media_url.strip()
+    if url.startswith("file://"):
+        try:
+            path = Path(url.replace("file://", "", 1))
+            return path if path.exists() else None
+        except Exception:
+            return None
+    try:
+        parsed = urlparse(url)
+        if parsed.path.startswith("/api/upload/"):
+            filename = Path(parsed.path).name
+            local_path = UPLOAD_DIR / filename
+            return local_path if local_path.exists() else None
+    except Exception:
+        pass
+    return None
+
+
+async def analyze_image_forensics(
+    image_url: str,
+    evidence_context: dict[str, Any],
+    llm_provider: str = "groq"
+) -> dict[str, Any]:
+    """
+    Analyze image authenticity using GROQ (default) or Backboard vision fallback.
+
+    Args:
+        image_url: URL to the image file
+        evidence_context: Dict with claims, entities, location, semantic_role, timestamp
+        llm_provider: LLM provider for forensic scoring ("groq" or "default")
+
+    Returns:
+        Dict with authenticity_score, manipulation_probability, quality_score, etc.
+    """
+    # Primary: Use GROQ for forensic scoring (text-based analysis)
+    from app.services import groq
+
+    if groq.is_available():
+        logger.info("Using GROQ for forensic scoring (text-based analysis)")
+
+        # Get image description from Backboard vision (free, no quota)
+        description = await describe_image(image_url, evidence_context)
+
+        if description:
+            # Use GROQ for forensic scoring
+            ai_scores = await groq.analyze_image_forensics_from_description(
+                description, evidence_context
+            )
+
+            if ai_scores and ai_scores.get("ml_accuracy", 0) > 0:
+                return ai_scores
+            else:
+                logger.warning("GROQ forensic scoring failed, falling back to Backboard vision")
+        else:
+            logger.warning("Backboard describe_image failed, falling back to Backboard vision")
+    else:
+        logger.warning("GROQ unavailable, falling back to Backboard vision")
+
+    # Fallback: Use Backboard Gemini vision (existing code continues below)
+    logger.info("Using Backboard Gemini vision for forensic analysis")
+
+    client = _get_client()
+    assistants = await get_or_create_assistants()
+
+    if not client or "claim_analyst" not in assistants:
+        logger.info("Backboard client or assistants not available for image analysis, using fallback scores")
+        return _generate_fallback_scores()
+
+    # Resolve to local path for Backboard SDK (cloud API cannot fetch file:// or localhost)
+    local_path = _resolve_media_to_local_path(image_url)
+    if local_path is None:
+        logger.warning("Could not resolve image to local path for forensic analysis: %s", image_url[:80])
+        return _generate_fallback_scores()
+
+    try:
+        logger.info("Starting image forensic analysis for: %s", local_path)
+        # Build forensic analysis prompt (image attached via files=)
+        prompt = f"""You are a forensic image analyst. Analyze the attached image for authenticity and manipulation.
+
+Evidence Context:
+- Claims: {evidence_context.get('claims', [])}
+- Entities: {evidence_context.get('entities', [])}
+- Location: {evidence_context.get('location', {})}
+- Semantic Role: {evidence_context.get('semantic_role', 'unknown')}
+- Timestamp: {evidence_context.get('timestamp')}
+
+Analyze and provide:
+1. Authenticity Score (0-100): How likely is this image authentic?
+2. Manipulation Probability (0-100): Evidence of editing/tampering?
+3. Quality Score (0-100): Image quality and resolution
+4. Manipulation Indicators: List specific signs of manipulation
+5. Context Consistency: Does image match the reported context?
+6. ML Accuracy (0-100): Your confidence in this forensic analysis based on image quality,
+   clarity of indicators, and ability to detect manipulation signs
+
+Return JSON format ONLY (no markdown, no preamble):
+{{
+  "authenticity_score": 85.5,
+  "manipulation_probability": 12.3,
+  "quality_score": 91.0,
+  "ml_accuracy": 87.5,
+  "manipulation_indicators": ["minor JPEG artifacts", "EXIF metadata intact"],
+  "context_consistency": "high",
+  "reasoning": "detailed analysis..."
+}}"""
+
+        # Use Claim Analyst assistant (has vision capabilities)
+        aid = getattr(assistants["claim_analyst"], "assistant_id", None) or getattr(assistants["claim_analyst"], "id", None)
+
+        if not aid:
+            return _generate_fallback_scores()
+
+        # Create a temporary thread for this analysis
+        thread = await client.create_thread(assistant_id=aid)
+        
+        # Extract thread_id robustly (SDK may return dataclass-like repr)
+        thread_id = _extract_thread_id(thread)
+        
+        if not thread_id or thread_id.startswith("<"):
+            logger.error(f"Invalid thread_id from Backboard: {thread_id}. Thread object: {thread}")
+            return _generate_fallback_scores()
+
+        # Send message with image attachment (Backboard SDK uploads file for vision analysis)
+        response = await client.add_message(
+            thread_id=thread_id,
+            content=prompt,
+            files=[str(local_path)],
+            llm_provider="google",
+            model_name="gemini-2.0-flash",
+            stream=False,
+        )
+
+        # Extract response text
+        response_text = ""
+        if hasattr(response, "message") and response.message:
+            response_text = response.message
+        elif hasattr(response, "content") and response.content:
+            response_text = response.content
+
+        # Parse JSON response
+        result = _parse_json(response_text)
+
+        if isinstance(result, dict) and "authenticity_score" in result:
+            # If ml_accuracy not provided by Gemini, calculate composite
+            if "ml_accuracy" not in result or result.get("ml_accuracy", 0) == 0:
+                result["ml_accuracy"] = (
+                    (result.get("authenticity_score", 65.0) * 0.5) +
+                    (result.get("quality_score", 70.0) * 0.3) +
+                    ((100 - result.get("manipulation_probability", 25.0)) * 0.2)
+                )
+            return result
+        else:
+            logger.warning("Invalid forensic analysis response format. Response (truncated): %s", (response_text or "")[:500])
+            return _generate_fallback_scores()
+
+    except Exception as e:
+        logger.exception("Backboard API error during image forensics analysis: %s", e)
+        logger.warning("Falling back to low-confidence forensic scores due to API error")
+        return _generate_fallback_scores()
+
+
+def _generate_fallback_scores() -> dict[str, Any]:
+    """Generate fallback forensic scores when API unavailable.
+    
+    Uses neutral-to-positive scores for original content while clearly indicating
+    that API is unavailable and manual review is needed.
+    """
+    return {
+        "authenticity_score": 65.0,
+        "manipulation_probability": 25.0,
+        "quality_score": 70.0,
+        "manipulation_indicators": ["Backboard API unavailable - manual review required"],
+        "context_consistency": "unknown",
+        "reasoning": "Automated analysis unavailable. Scores are baseline estimates pending API recovery.",
+        "ml_accuracy": 0.0,
+    }
+
+
+async def describe_image(image_url: str, evidence_context: dict[str, Any]) -> str:
+    """Get AI description of image content for key points extraction."""
+    client = _get_client()
+    if not client:
+        return ""
+    
+    try:
+        assistants = await get_or_create_assistants()
+        aid = getattr(assistants["claim_analyst"], "assistant_id", None) or getattr(assistants["claim_analyst"], "id", None)
+        
+        if not aid:
+            return ""
+        
+        prompt = f"""Describe this image in 1-2 concise sentences. Focus on:
+- What is visible in the image
+- Any people, objects, or activities
+- Location/setting if identifiable
+
+Context: {evidence_context}
+
+Provide ONLY the description, no preamble or explanation."""
+
+        # Create a temporary thread for this analysis
+        thread = await client.create_thread(assistant_id=aid)
+        
+        # Extract thread_id robustly (SDK may return dataclass-like repr)
+        thread_id = _extract_thread_id(thread)
+        
+        if not thread_id or thread_id.startswith("<"):
+            logger.error(f"Invalid thread_id from Backboard for image description: {thread_id}")
+            return ""
+        
+        # Send message
+        response = await client.add_message(
+            thread_id=thread_id,
+            content=prompt,
+            llm_provider="google",
+            model_name="gemini-2.0-flash",
+            stream=False,
+        )
+        
+        # Extract response text
+        response_text = ""
+        if hasattr(response, "message") and response.message:
+            response_text = response.message
+        elif hasattr(response, "content") and response.content:
+            response_text = response.content
+        
+        # Limit length and return
+        return response_text[:200] if response_text else ""
+        
+    except Exception as e:
+        logger.warning("describe_image failed: %s", e)
+        return ""

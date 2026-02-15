@@ -3,6 +3,7 @@ import io
 import logging
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import httpx
 from PIL import Image
@@ -38,6 +39,22 @@ except ImportError:
 
 def _fetch_image(url: str) -> bytes | None:
     """Fetch image bytes from URL."""
+    if url.startswith("file://"):
+        try:
+            path = Path(url.replace("file://", "", 1))
+            return path.read_bytes()
+        except Exception as e:
+            logger.warning("Failed to read local image %s: %s", url, e)
+            return None
+    try:
+        parsed = urlparse(url)
+        if parsed.path.startswith("/api/upload/"):
+            filename = Path(parsed.path).name
+            local_path = Path("/tmp/wolftrace-uploads") / filename
+            if local_path.exists():
+                return local_path.read_bytes()
+    except Exception as e:
+        logger.warning("Failed to read local upload from %s: %s", url, e)
     try:
         with httpx.Client(timeout=15.0) as client:
             r = client.get(url)

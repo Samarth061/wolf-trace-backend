@@ -114,6 +114,15 @@ MOCK_CASES = [
         "storyText": "Campus radio operators discovered an unauthorized broadcast on 107.3 FM between 3:00 and 4:00 AM. The broadcast contains repeated numeric sequences read by a synthesized voice. FCC records show no licensed operation on this frequency in the area.",
         "evidenceCount": 5,
     },
+    {
+        "id": "case-011",
+        "codename": "The Phantom Fire",
+        "location": "Science Building - East Wing",
+        "status": "Debunked",
+        "summary": "A student reported a fire in the Science Building, but official records confirm it was a false alarm. A fabricated image circulated on social media claiming to show the fire, revealing a coordinated misinformation campaign.",
+        "storyText": "On February 13th at 10:15 PM, a student posted on social media claiming to witness a fire in the Science Building East Wing. Campus Safety responded immediately and found no fire, confirming it as a false alarm at 10:22 PM. However, a fake image purporting to show flames in the building circulated widely on student messaging apps. Forensic analysis revealed the image was digitally manipulated using an older fire photo from a different location. The coordinated timing suggests deliberate misinformation.",
+        "evidenceCount": 3,
+    },
 ]
 
 # ============================================================================
@@ -258,6 +267,22 @@ MOCK_EVIDENCE = [
      "media_url": "/placeholder-evidence.jpg", "location": {"building": "Engineering Lab B - Hall 3", "lat": 0.0, "lng": 0.0}, "authenticity": "verified",
      "entities": ["Hooded Figure", "Backpack"], "locations": ["Engineering Lab B - Hall 3"],
      "key_points": ["Person in hoodie enters at 2:14 AM", "Carrying heavy backpack", "Exits at 2:47 AM without backpack"]},
+    # Case 011 - The Phantom Fire
+    {"id": "ev-028", "caseId": "case-011", "type": "text", "title": "Social Media Post - Fire Sighting",
+     "text_body": "Posted at 10:15 PM on Feb 13 by @campus_watcher_23 claiming to see flames from windows. States fire alarm not activated. Account created 2 days prior to post.",
+     "location": {"building": "Science Building - East Wing", "lat": 0.0, "lng": 0.0}, "authenticity": "suspicious",
+     "entities": ["@campus_watcher_23", "Science Building", "East Wing"], "locations": ["Science Building - East Wing", "Lab 3E"],
+     "key_points": ["Posted at 10:15 PM on Feb 13", "Claims to see flames from windows", "States fire alarm not activated", "Account created 2 days prior to post"]},
+    {"id": "ev-029", "caseId": "case-011", "type": "text", "title": "Campus Safety Incident Report #2847",
+     "text_body": "Responded to social media report at 10:18 PM. Full building sweep completed by 10:22 PM. No fire, smoke, or elevated temperatures detected. Fire suppression system shows no activation. Confirmed false alarm in official log.",
+     "location": {"building": "Science Building - East Wing", "lat": 0.0, "lng": 0.0}, "authenticity": "verified",
+     "entities": ["Officer Martinez", "Campus Safety", "Incident #2847"], "locations": ["Science Building - East Wing", "All floors"],
+     "key_points": ["Responded to social media report at 10:18 PM", "Full building sweep completed by 10:22 PM", "No fire, smoke, or elevated temperatures detected", "Fire suppression system shows no activation", "Confirmed false alarm in official log"]},
+    {"id": "ev-030", "caseId": "case-011", "type": "image", "title": "Alleged Fire Photo from Science Building",
+     "text_body": "Circulated on messaging apps at 10:25 PM (after official all-clear). Shows flames in building windows. Reverse image search: matches 2019 warehouse fire in Ohio. Image edited to add Science Building signage. EXIF data stripped, preventing origin verification.",
+     "media_url": "/placeholder-evidence.jpg", "location": {"building": "Science Building (claimed)", "lat": 0.0, "lng": 0.0}, "authenticity": "suspicious",
+     "entities": ["Image Manipulation", "Stock Photo", "Digital Forgery"], "locations": ["Science Building (claimed)", "Unknown (actual)"],
+     "key_points": ["Circulated on messaging apps at 10:25 PM (after official all-clear)", "Shows flames in building windows", "Reverse image search: matches 2019 warehouse fire in Ohio", "Image edited to add Science Building signage", "EXIF data stripped, preventing origin verification"]},
 ]
 
 # ============================================================================
@@ -287,6 +312,10 @@ MOCK_EVIDENCE_CONNECTIONS = [
     {"fromId": "ev-023", "toId": "ev-024", "relation": "supports", "caseId": "case-003"},
     {"fromId": "ev-026", "toId": "ev-027", "relation": "supports", "caseId": "case-003"},
     {"fromId": "ev-024", "toId": "ev-025", "relation": "related", "caseId": "case-003"},
+    # Case 011 connections - Fire misinformation inference
+    {"fromId": "ev-029", "toId": "ev-028", "relation": "contradicts", "caseId": "case-011"},
+    {"fromId": "ev-030", "toId": "ev-028", "relation": "supports", "caseId": "case-011"},
+    {"fromId": "ev-029", "toId": "ev-030", "relation": "contradicts", "caseId": "case-011"},
 ]
 
 # ============================================================================

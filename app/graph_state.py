@@ -90,6 +90,42 @@ def update_node(node_id: str, data_updates: dict[str, Any]) -> None:
         _nodes[node_id].data.update(data_updates)
 
 
+def delete_node(node_id: str) -> dict[str, Any]:
+    """Delete node and cascade to connected edges."""
+    if node_id not in _nodes:
+        raise ValueError(f"Node {node_id} not found")
+
+    # Find all connected edges
+    edges_to_delete = [
+        e for e in _edges
+        if e.source_id == node_id or e.target_id == node_id
+    ]
+
+    # Delete edges first
+    for edge in edges_to_delete:
+        _edges.remove(edge)
+
+    # Remove from adjacency
+    _adjacency.pop(node_id, None)
+    for neighbors in _adjacency.values():
+        if node_id in neighbors:
+            neighbors.remove(node_id)
+
+    # Remove from case reports tracking
+    for case_id, report_ids in _case_reports.items():
+        if node_id in report_ids:
+            report_ids.remove(node_id)
+
+    # Delete node
+    node = _nodes.pop(node_id)
+
+    return {
+        "deleted_node": node_id,
+        "deleted_edges": len(edges_to_delete),
+        "edge_ids": [e.id for e in edges_to_delete],
+    }
+
+
 def get_node(node_id: str) -> GraphNode | None:
     return _nodes.get(node_id)
 
@@ -100,6 +136,16 @@ def get_nodes_for_case(case_id: str) -> list[GraphNode]:
 
 def get_nodes_by_type(case_id: str, node_type: NodeType) -> list[GraphNode]:
     return [n for n in _nodes.values() if n.case_id == case_id and n.node_type == node_type]
+
+
+def get_external_source_by_query(case_id: str, search_query: str) -> GraphNode | None:
+    """Return existing external_source node with same search_query if any."""
+    q = (search_query or "")[:500]
+    for n in _nodes.values():
+        if n.case_id == case_id and n.node_type == NodeType.EXTERNAL_SOURCE:
+            if (n.data.get("search_query") or "")[:500] == q:
+                return n
+    return None
 
 
 def get_edges_for_node(node_id: str) -> list[GraphEdge]:
@@ -131,10 +177,21 @@ def set_controller(controller: "BlackboardController | None") -> None:
 
 
 def get_all_media_variants() -> list[GraphNode]:
-    """Get all media_variant nodes for pHash comparison."""
+    """Get all media_variant nodes for pHash comparison (legacy; prefer get_reports_with_phash)."""
     from app.models.graph import NodeType
 
     return [n for n in _nodes.values() if n.node_type == NodeType.MEDIA_VARIANT]
+
+
+def get_reports_with_phash(exclude_id: str | None = None) -> list[GraphNode]:
+    """Get report nodes that have phash in data (for consolidated forensics pHash comparison)."""
+    result = []
+    for n in _nodes.values():
+        if n.node_type != NodeType.REPORT or n.id == exclude_id:
+            continue
+        if n.data.get("phash"):
+            result.append(n)
+    return result
 
 
 def get_edges_for_case(case_id: str) -> list[GraphEdge]:
@@ -388,8 +445,10 @@ def create_and_add_node(
     node_id: str | None = None,
 ) -> GraphNode:
     nid = node_id or generate_node_id(prefix=node_type.value[:1].upper())
+    logger.info(f"Creating node {nid} of type {node_type.value} for case {case_id}")
     node = GraphNode(id=nid, node_type=node_type, case_id=case_id, data=data)
     add_node(node)
+    logger.info(f"Node {nid} created successfully, will be broadcast")
     return node
 
 
