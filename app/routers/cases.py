@@ -1,4 +1,6 @@
 """Cases router: GET/POST /api/cases, GET/POST /api/cases/{case_id}, evidence, edges."""
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from neo4j import Session as Neo4jSession
 
@@ -10,6 +12,7 @@ from app.services.graph_db import GraphDatabase
 from app.services import graph_queries
 
 router = APIRouter(prefix="/api", tags=["cases"])
+logger = logging.getLogger(__name__)
 
 
 @router.get("/cases")
@@ -21,28 +24,45 @@ async def list_cases():
 @router.post("/cases", response_model=CaseOut)
 async def create_case(
     body: CaseCreate,
-    session: Neo4jSession = Depends(GraphDatabase.get_session),
+    session: Neo4jSession | None = Depends(GraphDatabase.get_optional_session),
 ):
-    """Create a new case in Neo4j. Idempotent: MERGE on case_id."""
-    result = graph_queries.create_case(
-        session,
+    """Create a new case in Neo4j if available. Returns basic case object if Neo4j not configured."""
+    # Try to create in Neo4j if available
+    if session is not None:
+        try:
+            result = graph_queries.create_case(
+                session,
+                case_id=body.case_id,
+                title=body.title,
+                description=body.description,
+            )
+            if result:
+                cid = result.get("id", body.case_id)
+                return CaseOut(
+                    id=cid,
+                    case_id=cid,
+                    title=result.get("title", body.title),
+                    description=result.get("description", body.description),
+                    label=body.title or cid,
+                    status="active",
+                    node_count=0,
+                    updated_at=result.get("created_at"),
+                    created_at=result.get("created_at"),
+                )
+        except Exception as e:
+            logger.warning(f"Failed to create case in Neo4j: {e}")
+
+    # Fallback: return basic case object (Neo4j not available or failed)
+    from datetime import datetime
+    return CaseOut(
+        id=body.case_id,
         case_id=body.case_id,
         title=body.title,
         description=body.description,
-    )
-    if not result:
-        raise HTTPException(status_code=500, detail="Failed to create case in Neo4j")
-    cid = result.get("id", body.case_id)
-    return CaseOut(
-        id=cid,
-        case_id=cid,
-        title=result.get("title", body.title),
-        description=result.get("description", body.description),
-        label=body.title or cid,
+        label=body.title or body.case_id,
         status="active",
         node_count=0,
-        updated_at=result.get("created_at"),
-        created_at=result.get("created_at"),
+        created_at=datetime.utcnow().isoformat(),
     )
 
 
@@ -74,9 +94,9 @@ async def get_case(case_id: str):
 async def add_evidence(
     case_id: str,
     body: EvidenceCreate,
-    session: Neo4jSession = Depends(GraphDatabase.get_session),
+    session: Neo4jSession | None = Depends(GraphDatabase.get_optional_session),
 ):
-    """Upload raw evidence; saves to Neo4j, adds to in-memory graph, returns GraphNode shape."""
+    """Upload raw evidence; saves to Neo4j if available, adds to in-memory graph, returns GraphNode shape."""
     evidence_data = {
         "id": body.id,
         "type": body.type,
@@ -84,11 +104,13 @@ async def add_evidence(
         "url": body.url,
         "timestamp": body.timestamp,
     }
-    # Try Neo4j first (may fail if Neo4j not configured)
-    try:
-        graph_queries.add_evidence(session, case_id, evidence_data)
-    except Exception:
-        pass  # Neo4j optional, in-memory is the primary store
+    # Try Neo4j first (only if configured)
+    if session is not None:
+        try:
+            graph_queries.add_evidence(session, case_id, evidence_data)
+            logger.debug(f"Evidence saved to Neo4j: {body.id}")
+        except Exception as e:
+            logger.warning(f"Failed to save evidence to Neo4j: {e}")
 
     # Map evidence type string to NodeType
     type_map = {"text": NodeType.REPORT, "image": NodeType.REPORT, "video": NodeType.REPORT}
@@ -112,7 +134,7 @@ async def add_evidence(
 async def create_edge(
     case_id: str,
     body: EdgeCreate,
-    session: Neo4jSession = Depends(GraphDatabase.get_session),
+    session: Neo4jSession | None = Depends(GraphDatabase.get_optional_session),
 ):
     """Red String: link two nodes. Creates RELATED edge, emits edge:created for AI analysis."""
     edge_data = {
@@ -121,12 +143,13 @@ async def create_edge(
         "type": body.type,
         "note": body.note,
     }
-    # Try Neo4j first (may fail if Neo4j not configured)
-    result = None
-    try:
-        result = graph_queries.create_link(session, case_id, edge_data)
-    except Exception:
-        pass  # Neo4j optional
+    # Try Neo4j first (only if configured)
+    if session is not None:
+        try:
+            result = graph_queries.create_link(session, case_id, edge_data)
+            logger.debug(f"Edge saved to Neo4j: {body.source_id} -> {body.target_id}")
+        except Exception as e:
+            logger.warning(f"Failed to save edge to Neo4j: {e}")
 
     # Map edge type string to EdgeType
     type_lower = (body.type or "related").lower()
