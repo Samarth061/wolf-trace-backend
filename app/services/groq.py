@@ -136,6 +136,33 @@ async def generate_search_queries(claims: list[dict[str, Any]]) -> list[str]:
         return _mock_search_queries()
 
 
+async def generate_narrative(prompt: str) -> str:
+    """Generate case narrative using GROQ Llama 3.3 70B."""
+    client = _get_client()
+    if not client:
+        logger.warning("GROQ client unavailable")
+        return "Narrative generation unavailable"
+
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",  # Best for reasoning
+            messages=[
+                {"role": "system", "content": "You are a case narrative analyst for campus safety. Generate clear, factual narratives from evidence timelines."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.4,  # Balance creativity with accuracy
+            max_tokens=1000,
+        )
+
+        narrative = response.choices[0].message.content.strip()
+        logger.info(f"GROQ generate_narrative succeeded: {len(narrative)} chars")
+        return narrative
+
+    except Exception as e:
+        logger.warning(f"GROQ generate_narrative failed: {e}")
+        return "Narrative generation failed"
+
+
 def _parse_claims_json(text: str) -> dict[str, Any]:
     """Extract JSON from response, handling markdown code blocks."""
     text = text.strip()
@@ -274,4 +301,110 @@ CRITICAL: Return ONLY valid JSON in this exact format (no markdown, no preamble)
 
     except Exception as e:
         logger.warning(f"GROQ forensic analysis failed: {e}")
+        return {}
+
+
+async def analyze_video_deepfake(
+    video_description: str,
+    evidence_context: dict[str, Any]
+) -> dict[str, Any]:
+    """Analyze video for deepfake indicators based on text description using GROQ.
+
+    Args:
+        video_description: Text description of the video content
+        evidence_context: Dict with claims, entities, location, timestamp
+
+    Returns:
+        Dict with deepfake_probability, manipulation_probability, quality_score,
+        authenticity_score, ml_accuracy, indicators
+    """
+    client = _get_client()
+    if not client:
+        logger.warning("GROQ client unavailable for video deepfake analysis")
+        return {}
+
+    try:
+        # Build context string
+        context_str = ""
+        if evidence_context.get("claims"):
+            context_str += f"\nReported Claims: {json.dumps(evidence_context['claims'])}"
+        if evidence_context.get("location"):
+            context_str += f"\nLocation: {evidence_context['location']}"
+        if evidence_context.get("entities"):
+            context_str += f"\nEntities: {evidence_context['entities']}"
+        if evidence_context.get("timestamp"):
+            context_str += f"\nTimestamp: {evidence_context['timestamp']}"
+
+        prompt = f"""You are a forensic video analyst specializing in deepfake and manipulation detection.
+
+VIDEO DESCRIPTION:
+{video_description}
+
+EVIDENCE CONTEXT:{context_str}
+
+Analyze the video description for deepfake and manipulation indicators:
+1. **Deepfake Probability (0-100)**: Likelihood of AI-generated faces, synthetic voices, or deepfake technology
+2. **Manipulation Probability (0-100)**: Signs of video editing, splicing, or temporal manipulation
+3. **Authenticity Score (0-100)**: Overall authenticity of the video content
+4. **Quality Score (0-100)**: Video quality and resolution based on description
+5. **ML Accuracy (0-100)**: Your confidence in this text-based deepfake analysis
+6. **Indicators**: List specific red flags or authenticity markers found
+
+Consider deepfake indicators:
+- Unnatural facial movements or expressions
+- Audio-visual synchronization issues
+- Temporal inconsistencies or jump cuts
+- Lighting/shadow inconsistencies
+- Background artifacts or blur patterns
+- Lip-sync accuracy with speech
+- Natural eye movements and blinking
+- Consistent skin texture and tone
+- Context match with reported claims and location
+- Video quality appropriate for claimed capture device
+
+CRITICAL: Return ONLY valid JSON in this exact format (no markdown, no preamble):
+{{
+  "deepfake_probability": 15.0,
+  "manipulation_probability": 20.0,
+  "authenticity_score": 75.0,
+  "quality_score": 80.0,
+  "ml_accuracy": 70.0,
+  "indicators": ["specific indicator 1", "specific indicator 2"],
+  "context_consistency": "high|medium|low",
+  "reasoning": "brief explanation of scores"
+}}"""
+
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are a forensic video deepfake detection expert. Respond ONLY with valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=1500,
+        )
+
+        content = response.choices[0].message.content.strip()
+        result = _parse_claims_json(content)
+
+        if not isinstance(result, dict):
+            logger.warning("GROQ video deepfake analysis returned invalid format")
+            return {}
+
+        # Validate required fields
+        required = ["deepfake_probability", "manipulation_probability", "authenticity_score", "quality_score", "ml_accuracy"]
+        if not all(k in result for k in required):
+            logger.warning(f"GROQ video analysis missing required fields")
+            return {}
+
+        # Add metadata
+        result["analysis_method"] = "groq_text_based_video"
+        result["video_description"] = video_description[:200]
+        result["summary"] = video_description  # Use description as summary
+
+        logger.info(f"GROQ video deepfake analysis succeeded: ml_accuracy={result['ml_accuracy']:.1f}")
+        return result
+
+    except Exception as e:
+        logger.warning(f"GROQ video deepfake analysis failed: {e}")
         return {}

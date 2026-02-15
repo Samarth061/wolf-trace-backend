@@ -209,11 +209,11 @@ async def _process_video(
     # AI-powered deepfake detection
     deepfake_scores = {}
     try:
-        # Retry TwelveLabs API call with exponential backoff
-        async def call_twelvelabs():
-            return await twelvelabs.detect_deepfake(media_url, evidence_context)
-        
-        deepfake_scores = await _retry_api_call(call_twelvelabs, max_retries=3, backoff_base=1.0)
+        # Retry deepfake detection API call with exponential backoff
+        async def call_deepfake_detection():
+            return await twelvelabs.detect_deepfake(media_url, evidence_context, llm_provider=llm_provider)
+
+        deepfake_scores = await _retry_api_call(call_deepfake_detection, max_retries=3, backoff_base=1.0)
         
         if deepfake_scores:
             logger.info(f"TwelveLabs deepfake detection completed for {media_url}")

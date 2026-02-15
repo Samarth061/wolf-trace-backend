@@ -6,6 +6,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Request
 from neo4j import Session as Neo4jSession
 
+from app.config import settings
 from app.event_bus import emit
 from app.graph_state import get_all_cases, get_case_snapshot, create_and_add_node, create_and_add_edge, broadcast_graph_update
 from app.models.case import CaseCreate, CaseOut, EdgeCreate, EdgeOut, EvidenceCreate, EvidenceOut
@@ -616,9 +617,9 @@ async def delete_evidence(case_id: str, evidence_id: str):
 
 @router.post("/cases/{case_id}/chat")
 async def chat_with_evidence(case_id: str, body: dict[str, Any]):
-    """Chat with AI about evidence context using Backboard."""
+    """Chat with AI about evidence context using Groq (primary) or Backboard (fallback)."""
     from app.graph_state import get_node
-    from app.services import backboard_client
+    from app.services import backboard_client, groq
     import json
 
     message = body.get("message", "")
@@ -640,30 +641,67 @@ async def chat_with_evidence(case_id: str, body: dict[str, Any]):
             })
 
     # Build prompt with evidence context
-    prompt = f"""Evidence Context:\n{json.dumps(context, indent=2)}\n\nUser Question: {message}"""
+    context_str = json.dumps(context, indent=2) if context else "No specific evidence selected."
+    prompt = f"""You are an evidence analysis assistant for campus safety investigations.
 
-    # Send to Backboard (use Claim Analyst for general queries)
-    assistants = await backboard_client.get_or_create_assistants()
+Evidence Context:
+{context_str}
 
-    if not assistants or "claim_analyst" not in assistants:
-        raise HTTPException(status_code=503, detail="AI service unavailable")
+User Question: {message}
 
-    # Get or create thread for this case
-    threads = await backboard_client.create_case_thread(case_id)
-    thread_id = threads.get("claim_analyst")
+Provide a clear, factual response based on the evidence context. If analyzing forensics, reference specific metrics. If no evidence is provided, offer general guidance about what to look for."""
 
-    if not thread_id:
-        raise HTTPException(status_code=500, detail="Failed to create chat thread")
+    # Primary: Try Groq
+    if groq.is_available():
+        try:
+            client = groq._get_client()
+            if client:
+                response = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[
+                        {"role": "system", "content": "You are an evidence analysis assistant for campus safety. Provide clear, factual answers based on evidence."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.3,
+                    max_tokens=800,
+                )
 
-    # Send message and get response
-    response = await backboard_client.send_to_agent(
-        "claim_analyst",
-        thread_id,
-        prompt,
-    )
+                ai_response = response.choices[0].message.content.strip()
+                logger.info(f"Chat response from GROQ: {len(ai_response)} chars")
 
+                return {
+                    "response": ai_response,
+                    "sources": evidence_ids,
+                }
+        except Exception as e:
+            logger.warning(f"GROQ chat failed, trying Backboard: {e}")
+
+    # Fallback: Try Backboard
+    if backboard_client.is_available():
+        try:
+            assistants = await backboard_client.get_or_create_assistants()
+            if assistants and "claim_analyst" in assistants:
+                threads = await backboard_client.create_case_thread(case_id)
+                thread_id = threads.get("claim_analyst")
+
+                if thread_id:
+                    response = await backboard_client.send_to_agent(
+                        "claim_analyst",
+                        thread_id,
+                        prompt,
+                    )
+
+                    if response:
+                        return {
+                            "response": response,
+                            "sources": evidence_ids,
+                        }
+        except Exception as e:
+            logger.warning(f"Backboard chat failed: {e}")
+
+    # Last resort: Helpful error message
     return {
-        "response": response or "No response from AI",
+        "response": "AI assistant is currently unavailable. Please ensure GROQ_API_KEY or BACKBOARD_API_KEY is configured in the backend .env file.",
         "sources": evidence_ids,
     }
 
@@ -766,47 +804,27 @@ async def get_case_story(case_id: str):
             "key_moments": [],
         }
 
-    # Format timeline for AI
-    timeline_text = []
-    for i, node in enumerate(timeline, 1):
-        timestamp = node.data.get("timestamp", "Unknown time")
-        text_body = node.data.get("text_body", "No description")
-        title = node.data.get("title", f"Evidence {i}")
-        timeline_text.append(f"{i}. [{timestamp}] {title}: {text_body[:200]}")
+    # Prepare timeline data for AI with full context
+    timeline_data = []
+    for node in timeline:
+        timeline_data.append({
+            'timestamp': node.data.get("timestamp", "Unknown time"),
+            'data': node.data
+        })
 
-    # Format connections for AI
-    connections_text = []
+    # Prepare edge data for AI
+    edges_data = []
     for edge in edges:
-        source_node = next((n for n in nodes if n.id == edge.source_id), None)
-        target_node = next((n for n in nodes if n.id == edge.target_id), None)
-        if source_node and target_node:
-            source_title = source_node.data.get("title", edge.source_id)
-            target_title = target_node.data.get("title", edge.target_id)
-            connections_text.append(
-                f"- {source_title} → {edge.edge_type.value} → {target_title}"
-            )
-
-    # Generate narrative using AI
-    story_prompt = f"""Generate a coherent narrative for this investigation case.
-
-Timeline of Events:
-{chr(10).join(timeline_text)}
-
-Connections:
-{chr(10).join(connections_text[:20])}
-
-Generate a narrative with these sections:
-1. **Origin**: How the case started (1-2 sentences)
-2. **Progression**: How it evolved over time (2-3 sentences)
-3. **Current Status**: Where things stand now (1-2 sentences)
-
-Also identify 2-3 key turning points in the investigation.
-
-Keep the narrative factual, concise, and focused on the evidence timeline."""
+        edges_data.append({
+            'source_id': edge.source_id,
+            'target_id': edge.target_id,
+            'edge_type': edge.edge_type,
+            'data': edge.data
+        })
 
     try:
         # Use AI service to generate narrative
-        narrative = await ai_service.query_with_context(story_prompt)
+        narrative = await ai_service.generate_case_narrative(timeline_data, edges_data, case_id)
 
         # Extract sections from narrative (simple parsing)
         sections = _parse_narrative_sections(narrative)
@@ -837,31 +855,44 @@ Keep the narrative factual, concise, and focused on the evidence timeline."""
 
 
 def _parse_narrative_sections(narrative: str) -> dict[str, str]:
-    """Parse narrative into sections (simple implementation)."""
+    """Parse narrative into sections (Origin, Progression, Current Status)."""
     sections = {}
     current_section = None
     current_text = []
 
     for line in narrative.split("\n"):
-        if "**Origin" in line or "Origin:" in line:
-            if current_section:
+        line = line.strip()
+
+        # Check for section headers (markdown or plain text)
+        if "**Origin" in line or line.startswith("Origin:"):
+            # Save previous section
+            if current_section and current_text:
                 sections[current_section] = " ".join(current_text)
             current_section = "origin"
-            current_text = []
-        elif "**Progression" in line or "Progression:" in line:
-            if current_section:
+            # Extract text after header if any
+            text = line.split(":", 1)[-1].strip().replace("**", "")
+            current_text = [text] if text else []
+
+        elif "**Progression" in line or line.startswith("Progression:"):
+            if current_section and current_text:
                 sections[current_section] = " ".join(current_text)
             current_section = "progression"
-            current_text = []
-        elif "**Current" in line or "Status:" in line:
-            if current_section:
-                sections[current_section] = " ".join(current_text)
-            current_section = "status"
-            current_text = []
-        elif line.strip() and current_section:
-            current_text.append(line.strip())
+            text = line.split(":", 1)[-1].strip().replace("**", "")
+            current_text = [text] if text else []
 
-    if current_section:
+        elif "**Current Status" in line or "**Status" in line or line.startswith("Current Status:") or line.startswith("Status:"):
+            if current_section and current_text:
+                sections[current_section] = " ".join(current_text)
+            current_section = "current_status"
+            text = line.split(":", 1)[-1].strip().replace("**", "")
+            current_text = [text] if text else []
+
+        elif line and current_section:
+            # Add content to current section
+            current_text.append(line)
+
+    # Save final section
+    if current_section and current_text:
         sections[current_section] = " ".join(current_text)
 
     return sections
@@ -893,3 +924,50 @@ def _identify_key_moments(timeline: list, edges: list) -> list[dict[str, str]]:
         })
 
     return moments
+
+
+@router.get("/cases/{case_id}/story/audio")
+async def get_story_audio(case_id: str):
+    """Generate TTS audio for case story narrative."""
+    from fastapi.responses import Response
+    from app.services import elevenlabs
+    from app.graph_state import get_case_snapshot
+
+    # Get story
+    story = await get_case_story(case_id)
+    if not story or not story.get('narrative'):
+        raise HTTPException(status_code=404, detail="Story not available")
+
+    # Build audio text
+    case_snapshot = get_case_snapshot(case_id)
+    case_label = case_snapshot.get('label', case_id) if case_snapshot else case_id
+    audio_text = f"Case {case_label}. {story['narrative']}"
+
+    # Truncate to ElevenLabs limit (5000 chars)
+    if len(audio_text) > 5000:
+        audio_text = audio_text[:4997] + "..."
+
+    # Generate TTS
+    audio_bytes = await elevenlabs.text_to_speech(audio_text)
+
+    if not audio_bytes:
+        # Check if ElevenLabs is configured
+        if not settings.elevenlabs_api_key or not settings.elevenlabs_voice_id:
+            raise HTTPException(
+                status_code=501,
+                detail="Text-to-speech not configured. Please add ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID to .env file."
+            )
+        else:
+            raise HTTPException(
+                status_code=503,
+                detail="TTS service temporarily unavailable"
+            )
+
+    return Response(
+        content=audio_bytes,
+        media_type="audio/mpeg",
+        headers={
+            "Content-Disposition": f'inline; filename="{case_id}-story.mp3"',
+            "Cache-Control": "public, max-age=3600"
+        }
+    )

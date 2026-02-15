@@ -67,8 +67,8 @@ NEO4J_PASSWORD=...
 
 # Verification & Media
 FACTCHECK_API_KEY=...        # Google Fact Check Tools (falls back to GEMINI_API_KEY)
-TWELVELABS_API_KEY=...       # Video deepfake detection
-TWELVELABS_INDEX_ID=...
+TWELVELABS_API_KEY=...       # Video deepfake detection (optional - falls back to GROQ)
+TWELVELABS_INDEX_ID=...      # Twelve Labs index ID (create via create_twelvelabs_index.py)
 
 # Text-to-Speech
 ELEVENLABS_API_KEY=...       # TTS for alerts
@@ -76,7 +76,10 @@ ELEVENLABS_VOICE_ID=...
 
 # Configuration
 CORS_ORIGINS=http://localhost:3000,http://localhost:5173
-MEDIA_BASE_URL=http://localhost:8000
+MEDIA_BASE_URL=...           # Public URL for video files (REQUIRED for Twelve Labs)
+                              # - Local dev: http://localhost:8000 (Twelve Labs won't work)
+                              # - With ngrok: https://abc123.ngrok-free.app
+                              # - Production: Auto-detected from request (no config needed)
 ```
 
 ---
@@ -444,6 +447,69 @@ RUN pip install uv && uv sync
 COPY . .
 CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
+
+### Twelve Labs Video Analysis Configuration
+
+**Status**: Optional - System works without it (uses GROQ fallback)
+
+**When Twelve Labs Works Automatically**:
+- ✅ Backend deployed to public server (Railway, Render, Heroku, etc.)
+- ✅ Videos accessible via public URLs
+- ✅ No additional configuration needed
+
+**When Twelve Labs Doesn't Work**:
+- ❌ Local development (`localhost:8000`)
+- ❌ Videos not publicly accessible
+
+**Solutions**:
+
+1. **Production Deployment** (Recommended):
+   - Deploy backend to Railway, Render, Heroku, etc.
+   - Twelve Labs works automatically with no config changes
+
+2. **Local Development with ngrok**:
+   ```bash
+   # Terminal 1: Start ngrok
+   ngrok http 8000
+
+   # Copy ngrok URL (e.g., https://abc123.ngrok-free.app)
+   # Add to .env:
+   MEDIA_BASE_URL=https://abc123.ngrok-free.app
+
+   # Terminal 2: Restart backend
+   uvicorn app.main:app --reload
+   ```
+
+3. **Cloud Storage** (Optional for scalability):
+   - Upload videos to S3/Cloudinary
+   - Return cloud URLs instead of local paths
+
+**Setup Twelve Labs**:
+```bash
+# 1. Get API key from https://dashboard.twelvelabs.io/
+# 2. Create index
+python create_twelvelabs_index.py
+
+# 3. Add to .env
+TWELVELABS_API_KEY=tlk_...
+TWELVELABS_INDEX_ID=69915e248f018daf891a541a
+
+# 4. (Local dev only) Add ngrok URL
+MEDIA_BASE_URL=https://your-ngrok-url.ngrok-free.app
+```
+
+**What You Get**:
+- ✅ Semantic video search
+- ✅ Video summarization (Pegasus 1.2)
+- ✅ Advanced deepfake detection (Marengo 3.0)
+- ✅ Frame-by-frame analysis
+
+**Without Twelve Labs**:
+- ✅ GROQ handles video analysis
+- ✅ Text-based deepfake detection
+- ✅ Basic forensic scores
+- ❌ No semantic search
+- ❌ No video summaries
 
 ---
 
