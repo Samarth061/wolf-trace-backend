@@ -1,4 +1,5 @@
-"""Pipeline 1: Forensic Scanner — ELA, pHash, EXIF, TwelveLabs."""
+"""Pipeline 1: Forensic Scanner — ELA, pHash, EXIF, TwelveLabs. All stored in report node."""
+import asyncio
 import logging
 from datetime import datetime
 from typing import Any
@@ -7,14 +8,49 @@ from app.forensics.ela import analyze_media_from_url, hamming_distance
 from app.graph_state import (
     broadcast_graph_update,
     create_and_add_edge,
-    create_and_add_node,
-    get_all_media_variants,
     get_node,
+    get_reports_with_phash,
+    update_node,
 )
 from app.models.graph import EdgeType, NodeType
 from app.services import backboard_client, twelvelabs
 
 logger = logging.getLogger(__name__)
+
+
+async def _retry_api_call(coro_func, max_retries: int = 3, backoff_base: float = 1.0):
+    """Retry an async API call with exponential backoff.
+    
+    Args:
+        coro_func: A coroutine or function that returns a coroutine
+        max_retries: Number of retry attempts (default 3)
+        backoff_base: Base for exponential backoff in seconds
+    
+    Returns:
+        Result from the coroutine, or None if all retries fail
+    """
+    for attempt in range(max_retries):
+        try:
+            if callable(coro_func):
+                result = await coro_func()
+            else:
+                result = await coro_func
+            return result
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = backoff_base * (2 ** attempt)
+                logger.warning(
+                    f"API call failed (attempt {attempt + 1}/{max_retries}). "
+                    f"Retrying in {wait_time}s. Error: {e}"
+                )
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(
+                    f"API call failed after {max_retries} attempts. "
+                    f"Error: {e}"
+                )
+                return None
+    return None
 
 
 async def run_forensics(case_id: str, report_node_id: str, media_url: str | None) -> None:
@@ -63,16 +99,33 @@ async def _process_image(case_id: str, report_node_id: str, media_url: str) -> N
     # AI-powered forensic analysis using Backboard vision
     ai_scores = {}
     try:
-        ai_scores = await backboard_client.analyze_image_forensics(media_url, evidence_context)
-        logger.info(f"Backboard analysis completed for {media_url}")
+        # Retry Backboard API call with exponential backoff
+        async def call_backboard():
+            return await backboard_client.analyze_image_forensics(media_url, evidence_context)
+        
+        ai_scores = await _retry_api_call(call_backboard, max_retries=3, backoff_base=1.0)
+        
+        if ai_scores:
+            logger.info(f"Backboard analysis completed for {media_url}")
+        else:
+            logger.warning(f"Backboard analysis failed after retries for {media_url}")
+            # Use fallback scores if all retries exhausted
+            ai_scores = {
+                "authenticity_score": 65.0,
+                "manipulation_probability": 25.0,
+                "quality_score": 70.0,
+                "manipulation_indicators": ["Backboard API unavailable - manual review required"],
+                "ml_accuracy": 0.0,
+            }
     except Exception as e:
-        logger.warning(f"Backboard image analysis failed: {e}")
-        # Use fallback scores if AI analysis fails
+        logger.exception(f"Unexpected error in Backboard analysis: {e}")
+        # Use fallback scores if unexpected error
         ai_scores = {
-            "authenticity_score": 75.0,
-            "manipulation_probability": 15.0,
+            "authenticity_score": 65.0,
+            "manipulation_probability": 25.0,
             "quality_score": 70.0,
-            "manipulation_indicators": ["AI analysis unavailable"],
+            "manipulation_indicators": ["Backboard API unavailable - manual review required"],
+            "ml_accuracy": 0.0,
         }
 
     data: dict[str, Any] = {
@@ -81,23 +134,17 @@ async def _process_image(case_id: str, report_node_id: str, media_url: str) -> N
         "ela_available": ela_available,
         "media_url": media_url,
         "hamming_distances": [],
-        # AI forensic scores
-        "authenticity_score": ai_scores.get("authenticity_score", 75.0),
-        "manipulation_probability": ai_scores.get("manipulation_probability", 15.0),
+        "authenticity_score": ai_scores.get("authenticity_score", 65.0),
+        "manipulation_probability": ai_scores.get("manipulation_probability", 25.0),
         "quality_score": ai_scores.get("quality_score", 70.0),
         "manipulation_indicators": ai_scores.get("manipulation_indicators", []),
-        "ml_accuracy": ai_scores.get("ml_accuracy", 0.91),
+        "indicators": ai_scores.get("manipulation_indicators", []),
+        "ml_accuracy": ai_scores.get("ml_accuracy", 0.0),
         "analyzed_at": datetime.utcnow().isoformat(),
     }
 
-    media_node = create_and_add_node(NodeType.MEDIA_VARIANT, case_id, data)
-    await broadcast_graph_update("add_node", media_node.model_dump(mode="json"))
-
-    # Compare against existing media
-    existing = get_all_media_variants()
-    for other in existing:
-        if other.id == media_node.id:
-            continue
+    existing_reports = get_reports_with_phash(exclude_id=report_node_id)
+    for other in existing_reports:
         other_phash = other.data.get("phash")
         if not phash or not other_phash:
             continue
@@ -105,21 +152,17 @@ async def _process_image(case_id: str, report_node_id: str, media_url: str) -> N
         if dist < 0:
             continue
         data["hamming_distances"].append({"node_id": other.id, "distance": dist})
-
         if 0 <= dist <= 5:
-            edge = create_and_add_edge(
-                EdgeType.REPOST_OF, media_node.id, other.id, case_id, {"hamming": dist}
-            )
+            edge = create_and_add_edge(EdgeType.REPOST_OF, report_node_id, other.id, case_id, {"hamming": dist})
             await broadcast_graph_update("add_edge", edge.model_dump(mode="json"))
         elif 6 <= dist <= 15:
-            edge = create_and_add_edge(
-                EdgeType.MUTATION_OF, media_node.id, other.id, case_id, {"hamming": dist}
-            )
+            edge = create_and_add_edge(EdgeType.MUTATION_OF, report_node_id, other.id, case_id, {"hamming": dist})
             await broadcast_graph_update("add_edge", edge.model_dump(mode="json"))
 
-    # Update node with hamming distances
-    media_node.data["hamming_distances"] = data["hamming_distances"]
-    await broadcast_graph_update("update_node", media_node.model_dump(mode="json"))
+    update_node(report_node_id, data)
+    updated = get_node(report_node_id)
+    if updated:
+        await broadcast_graph_update("update_node", updated.model_dump(mode="json"))
 
 
 async def _process_video(case_id: str, report_node_id: str, media_url: str) -> None:
@@ -144,17 +187,35 @@ async def _process_video(case_id: str, report_node_id: str, media_url: str) -> N
     # AI-powered deepfake detection
     deepfake_scores = {}
     try:
-        deepfake_scores = await twelvelabs.detect_deepfake(media_url, evidence_context)
-        logger.info(f"TwelveLabs deepfake detection completed for {media_url}")
+        # Retry TwelveLabs API call with exponential backoff
+        async def call_twelvelabs():
+            return await twelvelabs.detect_deepfake(media_url, evidence_context)
+        
+        deepfake_scores = await _retry_api_call(call_twelvelabs, max_retries=3, backoff_base=1.0)
+        
+        if deepfake_scores:
+            logger.info(f"TwelveLabs deepfake detection completed for {media_url}")
+        else:
+            logger.warning(f"TwelveLabs deepfake detection failed after retries for {media_url}")
+            # Use fallback scores if all retries exhausted
+            deepfake_scores = {
+                "deepfake_probability": 20.0,
+                "manipulation_probability": 25.0,
+                "quality_score": 65.0,
+                "authenticity_score": 60.0,
+                "ml_accuracy": 0.0,
+                "indicators": ["TwelveLabs API unavailable - manual review required"],
+            }
     except Exception as e:
-        logger.warning(f"TwelveLabs deepfake detection failed: {e}")
-        # Use fallback scores
+        logger.exception(f"Unexpected error in TwelveLabs deepfake detection: {e}")
+        # Use fallback scores if unexpected error
         deepfake_scores = {
-            "deepfake_probability": 10.0,
-            "manipulation_probability": 12.0,
-            "quality_score": 75.0,
-            "authenticity_score": 80.0,
-            "indicators": ["AI analysis unavailable"],
+            "deepfake_probability": 20.0,
+            "manipulation_probability": 25.0,
+            "quality_score": 65.0,
+            "authenticity_score": 60.0,
+            "ml_accuracy": 0.0,
+            "indicators": ["TwelveLabs API unavailable - manual review required"],
         }
 
     data: dict[str, Any] = {
@@ -163,14 +224,16 @@ async def _process_video(case_id: str, report_node_id: str, media_url: str) -> N
         "index_task": result.get("index_task"),
         "summary": result.get("summary"),
         "search_results": result.get("search_results", []),
-        # AI deepfake detection scores
-        "deepfake_probability": deepfake_scores.get("deepfake_probability", 10.0),
-        "manipulation_probability": deepfake_scores.get("manipulation_probability", 12.0),
-        "quality_score": deepfake_scores.get("quality_score", 75.0),
-        "authenticity_score": deepfake_scores.get("authenticity_score", 80.0),
-        "ml_accuracy": deepfake_scores.get("ml_accuracy", 0.94),
+        "deepfake_probability": deepfake_scores.get("deepfake_probability", 20.0),
+        "manipulation_probability": deepfake_scores.get("manipulation_probability", 25.0),
+        "quality_score": deepfake_scores.get("quality_score", 65.0),
+        "authenticity_score": deepfake_scores.get("authenticity_score", 60.0),
+        "ml_accuracy": deepfake_scores.get("ml_accuracy", 0.0),
         "indicators": deepfake_scores.get("indicators", []),
+        "manipulation_indicators": deepfake_scores.get("indicators", []),
         "analyzed_at": datetime.utcnow().isoformat(),
     }
-    media_node = create_and_add_node(NodeType.MEDIA_VARIANT, case_id, data)
-    await broadcast_graph_update("add_node", media_node.model_dump(mode="json"))
+    update_node(report_node_id, data)
+    updated = get_node(report_node_id)
+    if updated:
+        await broadcast_graph_update("update_node", updated.model_dump(mode="json"))

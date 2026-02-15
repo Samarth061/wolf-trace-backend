@@ -29,7 +29,7 @@ class CaseOut(BaseModel):
 class EvidenceCreate(BaseModel):
     """Request body for POST /api/cases/{case_id}/evidence."""
 
-    id: str
+    id: Optional[str] = None  # Auto-generated if not provided
     type: str = "text"  # e.g. 'photo', 'text', 'video'
     content: str = ""
     url: Optional[str] = None

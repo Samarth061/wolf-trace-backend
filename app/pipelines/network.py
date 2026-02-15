@@ -1,17 +1,30 @@
-"""Pipeline 2: Network Crawler — Backboard/Gemini claims + Fact Check + search queries."""
+"""Pipeline 2: Network Crawler — Backboard/Gemini claims, Fact Check, search queries. All stored in report node."""
 import logging
 from typing import Any
 
-from app.graph_state import (
-    broadcast_graph_update,
-    create_and_add_edge,
-    create_and_add_node,
-    get_node,
-)
-from app.models.graph import EdgeType, NodeType
+from app.graph_state import broadcast_graph_update, get_node, update_node
 from app.services import ai, factcheck
 
 logger = logging.getLogger(__name__)
+
+# Map fact-check ratings to confidence contribution (0-1)
+_RATING_SCORE = {"true": 1.0, "verified": 0.95, "correct": 0.9, "mostly true": 0.8, "half true": 0.5, "unproven": 0.3, "false": 0.1, "fake": 0.0, "debunked": 0.0}
+
+
+def _confidence_from_fact_checks(fact_checks: list[dict[str, Any]]) -> float:
+    """Compute confidence (0-1) from fact check ratings."""
+    if not fact_checks:
+        return 0.5
+    scores = []
+    for fc in fact_checks:
+        rating = (fc.get("rating") or "").lower()
+        s = _RATING_SCORE.get(rating, 0.5)
+        for k, v in _RATING_SCORE.items():
+            if k in rating:
+                s = v
+                break
+        scores.append(s)
+    return sum(scores) / len(scores) if scores else 0.5
 
 
 async def run_network(
@@ -22,9 +35,8 @@ async def run_network(
     timestamp: str = "",
 ) -> None:
     """
-    Send report text to Backboard Claim Analyst (or Gemini fallback) for claim extraction.
-    Query Fact Check API for each claim -> FactCheck nodes + DEBUNKED_BY edges.
-    Generate search queries -> ExternalSource nodes + SIMILAR_TO edges.
+    Extract claims, fact-check, generate search queries. Store all in report node data.
+    No separate fact_check or external_source nodes. Confidence derived from fact check ratings.
     """
     extracted = await ai.extract_claims(report_text, case_id=case_id, location=location, timestamp=timestamp)
     claims = extracted.get("claims", [])
@@ -32,57 +44,46 @@ async def run_network(
     misinformation_flags = extracted.get("misinformation_flags", [])
     suggested_verifications = extracted.get("suggested_verifications", [])
 
-    # Update report node with extracted data
     report_node = get_node(report_node_id)
-    if report_node:
-        report_node.data.update({
-            "claims": claims,
-            "urgency": urgency,
-            "misinformation_flags": misinformation_flags,
-            "suggested_verifications": suggested_verifications,
-        })
-        await broadcast_graph_update("update_node", report_node.model_dump(mode="json"))
+    if not report_node:
+        return
 
-    # Fact check each claim
+    fact_checks: list[dict[str, Any]] = []
     for claim in claims:
         statement = claim.get("statement", "")
         if not statement:
             continue
         fc_results = await factcheck.search_claims(statement)
-        for fc in fc_results[:3]:  # Top 3 results
+        for fc in fc_results[:3]:
             claim_text = fc.get("text", "") or statement
             rating = (fc.get("claimReview", [{}])[0] if fc.get("claimReview") else {}).get("textualRating", "unknown")
             reviewer = (fc.get("claimReview", [{}])[0] if fc.get("claimReview") else {}).get("publisher", {}).get("name", "unknown")
             url = (fc.get("claimReview", [{}])[0] if fc.get("claimReview") else {}).get("url", "")
-            fc_data = {
+            fact_checks.append({
                 "claim_text": claim_text[:300],
                 "rating": rating,
                 "reviewer": reviewer,
                 "url": url,
-            }
-            fc_node = create_and_add_node(NodeType.FACT_CHECK, case_id, fc_data)
-            await broadcast_graph_update("add_node", fc_node.model_dump(mode="json"))
-            edge = create_and_add_edge(
-                EdgeType.DEBUNKED_BY, report_node_id, fc_node.id, case_id
-            )
-            await broadcast_graph_update("add_edge", edge.model_dump(mode="json"))
+            })
 
-    # Generate search queries and create ExternalSource nodes
     queries = await ai.generate_search_queries(claims)
-    for q in queries:
-        ext_data: dict[str, Any] = {
-            "search_query": q,
-            "platform": "web",
-            "url": "",
-            "status": "pending",
-        }
-        ext_node = create_and_add_node(NodeType.EXTERNAL_SOURCE, case_id, ext_data)
-        await broadcast_graph_update("add_node", ext_node.model_dump(mode="json"))
-        edge = create_and_add_edge(
-            EdgeType.SIMILAR_TO,
-            report_node_id,
-            ext_node.id,
-            case_id,
-            {"confidence": 0.5},
-        )
-        await broadcast_graph_update("add_edge", edge.model_dump(mode="json"))
+    search_queries = [{"query": q, "platform": "web", "status": "pending"} for q in queries]
+
+    fc_confidence = _confidence_from_fact_checks(fact_checks)
+    existing = report_node.data.get("confidence")
+    confidence = fc_confidence if existing is None else (float(existing) + fc_confidence) / 2.0
+
+    update_node(report_node_id, {
+        "claims": claims,
+        "urgency": urgency,
+        "misinformation_flags": misinformation_flags,
+        "suggested_verifications": suggested_verifications,
+        "fact_checks": fact_checks,
+        "fact_check_results": fact_checks,
+        "search_queries": search_queries,
+        "debunk_count": sum(1 for fc in fact_checks if "false" in (fc.get("rating") or "").lower() or "debunk" in (fc.get("rating") or "").lower()),
+        "confidence": min(1.0, max(0.0, confidence)),
+    })
+    updated = get_node(report_node_id)
+    if updated:
+        await broadcast_graph_update("update_node", updated.model_dump(mode="json"))

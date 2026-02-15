@@ -1,6 +1,6 @@
 """Knowledge Source: Node role classifier — Originator, Amplifier, Mutator, Unwitting Sharer."""
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from app.graph_state import (
@@ -13,6 +13,8 @@ from app.graph_state import (
 from app.models.graph import EdgeType, NodeSemanticRole, NodeType
 
 logger = logging.getLogger(__name__)
+
+_AWARE_MAX = datetime.max.replace(tzinfo=timezone.utc)
 
 
 async def run_classifier(payload: dict[str, Any]) -> None:
@@ -69,20 +71,28 @@ def _classify_node(node: Any, all_reports: list[Any]) -> tuple[NodeSemanticRole 
         return NodeSemanticRole.UNWITTING_SHARER, 0.70
 
     # Fallback: earliest node is Originator
-    earliest = min(all_reports, key=lambda n: _get_timestamp(n) or datetime.max)
+    earliest = min(all_reports, key=lambda n: _get_timestamp(n) or _AWARE_MAX)
     if node.id == earliest.id:
         return NodeSemanticRole.ORIGINATOR, 0.80
 
     return None, 0.0
 
 
-def _get_timestamp(node: Any) -> datetime | None:
-    ts = node.data.get("timestamp") or node.data.get("created_at")
+def _normalize_timestamp(ts: Any) -> datetime | None:
     if not ts:
         return None
     if isinstance(ts, str):
         try:
-            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
         except Exception:
             return None
-    return ts
+    if isinstance(ts, datetime):
+        if ts.tzinfo is None:
+            return ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(timezone.utc)
+    return None
+
+
+def _get_timestamp(node: Any) -> datetime | None:
+    ts = node.data.get("timestamp") or node.data.get("created_at")
+    return _normalize_timestamp(ts)

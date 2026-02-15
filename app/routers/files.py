@@ -5,12 +5,16 @@ Handles media file uploads for forensic analysis.
 Files are saved temporarily and their URLs are returned for evidence creation.
 """
 
-from fastapi import APIRouter, UploadFile, File, HTTPException
-from typing import Dict
+from fastapi import APIRouter, UploadFile, File, HTTPException, Request
+from typing import Dict, Any
 import os
 import shutil
 from pathlib import Path
 import uuid
+
+from fastapi.responses import FileResponse
+
+from app.config import settings
 
 router = APIRouter(prefix="/api", tags=["files"])
 
@@ -19,8 +23,22 @@ UPLOAD_DIR = Path("/tmp/wolftrace-uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _safe_resolve(path: Path) -> Path:
+    resolved = path.resolve()
+    if resolved.parent != UPLOAD_DIR.resolve():
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return resolved
+
+
+def _build_public_url(request: Request, filename: str) -> str:
+    base = settings.media_base_url.strip().rstrip("/")
+    if base:
+        return f"{base}/api/upload/{filename}"
+    return str(request.base_url).rstrip("/") + f"/api/upload/{filename}"
+
+
 @router.post("/upload")
-async def upload_file(file: UploadFile = File(...)) -> Dict[str, str]:
+async def upload_file(request: Request, file: UploadFile = File(...)) -> Dict[str, Any]:
     """
     Upload a media file (image, video, or audio) for forensic analysis.
 
@@ -48,11 +66,12 @@ async def upload_file(file: UploadFile = File(...)) -> Dict[str, str]:
         with file_path.open("wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Return file URL (using file:// protocol for local files)
-        file_url = f"file://{file_path}"
+        # Return public URL for external services
+        public_url = _build_public_url(request, unique_filename)
 
         return {
-            "url": file_url,
+            "url": public_url,
+            "file_url": public_url,
             "filename": file.filename or unique_filename,
             "content_type": file.content_type,
             "size": file_path.stat().st_size
@@ -60,6 +79,17 @@ async def upload_file(file: UploadFile = File(...)) -> Dict[str, str]:
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
+
+
+@router.get("/upload/{filename}")
+async def get_file(filename: str) -> FileResponse:
+    """
+    Serve an uploaded file over HTTP.
+    """
+    file_path = _safe_resolve(UPLOAD_DIR / filename)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(str(file_path))
 
 
 @router.delete("/upload/{filename}")
@@ -73,7 +103,7 @@ async def delete_file(filename: str) -> Dict[str, str]:
     Returns:
         Success message
     """
-    file_path = UPLOAD_DIR / filename
+    file_path = _safe_resolve(UPLOAD_DIR / filename)
 
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")

@@ -139,7 +139,12 @@ async def detect_deepfake(video_url: str, evidence_context: dict[str, Any]) -> d
         Dict with deepfake_probability, manipulation_probability, quality_score, etc.
     """
     if not settings.twelvelabs_api_key or not settings.twelvelabs_index_id:
-        logger.warning("TwelveLabs API key or index ID missing")
+        missing = []
+        if not settings.twelvelabs_api_key:
+            missing.append("API key")
+        if not settings.twelvelabs_index_id:
+            missing.append("index ID")
+        logger.error(f"TwelveLabs configuration incomplete: missing {', '.join(missing)}")
         return _generate_fallback_video_scores()
 
     try:
@@ -206,7 +211,8 @@ Look for signs of deepfake technology or video manipulation."""
         }
 
     except Exception as e:
-        logger.exception(f"detect_deepfake failed: {e}")
+        logger.exception(f"TwelveLabs API error during deepfake detection: {e}")
+        logger.warning("Falling back to low-confidence deepfake detection scores")
         return _generate_fallback_video_scores()
 
 
@@ -281,15 +287,19 @@ def _extract_indicators(search_results: list[dict[str, Any]]) -> list[str]:
 
 
 def _generate_fallback_video_scores() -> dict[str, Any]:
-    """Generate fallback scores when TwelveLabs unavailable."""
+    """Generate fallback scores when TwelveLabs unavailable.
+    
+    Uses neutral-to-positive scores for original video content while clearly indicating
+    that API is unavailable and manual review is needed.
+    """
     return {
-        "deepfake_probability": 10.0,
-        "manipulation_probability": 12.0,
-        "quality_score": 75.0,
-        "authenticity_score": 80.0,
+        "deepfake_probability": 20.0,
+        "manipulation_probability": 25.0,
+        "quality_score": 65.0,
+        "authenticity_score": 60.0,
         "ml_accuracy": 0.0,
         "indicators": ["TwelveLabs API unavailable - manual review required"],
-        "summary": "Automatic analysis unavailable",
+        "summary": "Automatic deepfake analysis unavailable. Baseline estimate provided pending API recovery.",
         "video_id": None,
         "task_id": None,
     }

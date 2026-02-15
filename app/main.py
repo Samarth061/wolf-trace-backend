@@ -28,6 +28,8 @@ async def lifespan(app: FastAPI):
             logger.info("Backboard assistants ready: %d", len(assistants))
         except Exception as e:
             logger.warning("Backboard assistants init failed: %s", e)
+    else:
+        logger.info("BACKBOARD_API_KEY not set — forensic analysis will use fallback scores")
 
     # Neo4j AuraDB: connect and verify
     graph_db = GraphDatabase.get_instance()

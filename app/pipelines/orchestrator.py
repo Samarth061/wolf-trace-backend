@@ -3,7 +3,7 @@ import logging
 from typing import Any
 
 from app.pipelines.blackboard_controller import BlackboardController, Priority
-from app.pipelines import case_synthesizer, classifier, clustering, forensics, forensics_xref, network, recluster_debunk
+from app.pipelines import case_synthesizer, classifier, clustering, forensics, forensics_xref, network
 
 logger = logging.getLogger(__name__)
 
@@ -92,20 +92,10 @@ def register_knowledge_sources() -> BlackboardController:
             "edge:similar_to",
             "edge:repost_of",
             "edge:mutation_of",
-            "edge:debunked_by",
             "edge:amplified_by",
-            "node:fact_check",
-            "node:external_source",
         ],
         handler=classifier.run_classifier,
         cooldown_seconds=2.0,
-    )
-    ctrl.register(
-        name="recluster_debunk",
-        priority=Priority.HIGH,
-        trigger_types=["edge:debunked_by"],
-        handler=recluster_debunk.run_recluster_debunk,
-        cooldown_seconds=1.0,
     )
     ctrl.register(
         name="case_synthesizer",

@@ -1,6 +1,6 @@
 """Pipeline 3: Clustering — temporal, geo, semantic deduplication."""
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from math import asin, cos, radians, sin, sqrt
 from typing import Any
 
@@ -21,6 +21,21 @@ SIMILARITY_THRESHOLD = 0.4
 WEIGHT_TEMPORAL = 0.3
 WEIGHT_GEO = 0.3
 WEIGHT_SEMANTIC = 0.4
+
+
+def _normalize_timestamp(ts: Any) -> datetime | None:
+    if not ts:
+        return None
+    if isinstance(ts, str):
+        try:
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if isinstance(ts, datetime):
+        if ts.tzinfo is None:
+            return ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(timezone.utc)
+    return None
 
 
 def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -44,14 +59,7 @@ async def run_clustering(
     Signals: temporal proximity (30 min), geo (200m), semantic (keyword overlap).
     If combined score >= 0.4, merge with SIMILAR_TO edge.
     """
-    report_ts = report_data.get("timestamp")
-    if isinstance(report_ts, str):
-        try:
-            report_ts = datetime.fromisoformat(report_ts.replace("Z", "+00:00"))
-        except Exception:
-            report_ts = datetime.utcnow()
-    elif not report_ts:
-        report_ts = datetime.utcnow()
+    report_ts = _normalize_timestamp(report_data.get("timestamp")) or datetime.now(timezone.utc)
 
     loc = report_data.get("location") or {}
     report_lat = loc.get("lat")
@@ -70,14 +78,7 @@ async def run_clustering(
             continue
 
         # Temporal
-        exist_ts = existing.get("timestamp") or existing.get("created_at")
-        if isinstance(exist_ts, str):
-            try:
-                exist_ts = datetime.fromisoformat(exist_ts.replace("Z", "+00:00"))
-            except Exception:
-                exist_ts = datetime.utcnow()
-        elif not exist_ts:
-            exist_ts = datetime.utcnow()
+        exist_ts = _normalize_timestamp(existing.get("timestamp") or existing.get("created_at")) or datetime.now(timezone.utc)
         delta = abs((report_ts - exist_ts).total_seconds())
         temporal_score = 1.0 if delta <= TEMPORAL_WINDOW_MINUTES * 60 else max(0, 1 - delta / 3600)
 

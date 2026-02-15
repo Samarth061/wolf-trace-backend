@@ -138,6 +138,16 @@ def get_nodes_by_type(case_id: str, node_type: NodeType) -> list[GraphNode]:
     return [n for n in _nodes.values() if n.case_id == case_id and n.node_type == node_type]
 
 
+def get_external_source_by_query(case_id: str, search_query: str) -> GraphNode | None:
+    """Return existing external_source node with same search_query if any."""
+    q = (search_query or "")[:500]
+    for n in _nodes.values():
+        if n.case_id == case_id and n.node_type == NodeType.EXTERNAL_SOURCE:
+            if (n.data.get("search_query") or "")[:500] == q:
+                return n
+    return None
+
+
 def get_edges_for_node(node_id: str) -> list[GraphEdge]:
     outgoing = [e for e in _edges if e.source_id == node_id]
     incoming = [e for e in _edges if e.target_id == node_id]
@@ -167,10 +177,21 @@ def set_controller(controller: "BlackboardController | None") -> None:
 
 
 def get_all_media_variants() -> list[GraphNode]:
-    """Get all media_variant nodes for pHash comparison."""
+    """Get all media_variant nodes for pHash comparison (legacy; prefer get_reports_with_phash)."""
     from app.models.graph import NodeType
 
     return [n for n in _nodes.values() if n.node_type == NodeType.MEDIA_VARIANT]
+
+
+def get_reports_with_phash(exclude_id: str | None = None) -> list[GraphNode]:
+    """Get report nodes that have phash in data (for consolidated forensics pHash comparison)."""
+    result = []
+    for n in _nodes.values():
+        if n.node_type != NodeType.REPORT or n.id == exclude_id:
+            continue
+        if n.data.get("phash"):
+            result.append(n)
+    return result
 
 
 def get_edges_for_case(case_id: str) -> list[GraphEdge]:

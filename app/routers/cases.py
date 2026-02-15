@@ -1,6 +1,7 @@
 """Cases router: GET/POST /api/cases, GET/POST /api/cases/{case_id}, evidence, edges."""
 import logging
 from typing import Any
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from neo4j import Session as Neo4jSession
@@ -98,6 +99,11 @@ async def add_evidence(
     session: Neo4jSession | None = Depends(GraphDatabase.get_optional_session),
 ):
     """Upload raw evidence; saves to Neo4j if available, adds to in-memory graph, returns GraphNode shape."""
+    # Auto-generate unique ID if not provided
+    import uuid
+    if not body.id:
+        body.id = f"ev-{int(datetime.utcnow().timestamp() * 1000)}-{uuid.uuid4().hex[:6]}"
+    
     evidence_data = {
         "id": body.id,
         "type": body.type,
@@ -380,9 +386,33 @@ async def analyze_forensics(case_id: str, evidence_id: str):
     # Add metadata
     forensic_results["analyzed_at"] = datetime.utcnow().isoformat()
     forensic_results["media_url"] = media_url
+    
+    # Add 'indicators' as alias for 'manipulation_indicators' for frontend compatibility
+    if "manipulation_indicators" in forensic_results and "indicators" not in forensic_results:
+        forensic_results["indicators"] = forensic_results["manipulation_indicators"]
+    
+    # Determine authenticity from forensic scores
+    authenticity = _determine_authenticity(forensic_results)
+    
+    # Extract key points from media and forensic analysis
+    key_points = await _extract_media_key_points(
+        media_url,
+        forensic_results.get("media_type", "image"),
+        forensic_results,
+        evidence_context
+    )
+    
+    # Calculate confidence score (ml_accuracy as 0-1 score)
+    ml_accuracy = forensic_results.get("ml_accuracy", 0.0)
+    confidence = ml_accuracy / 100.0 if ml_accuracy > 1 else ml_accuracy
 
-    # Store in node.data.forensics
-    update_node(evidence_id, {"forensics": forensic_results})
+    # Store forensics, authenticity, key_points, and confidence in node data
+    update_node(evidence_id, {
+        "forensics": forensic_results,
+        "authenticity": authenticity,
+        "key_points": key_points,
+        "confidence": confidence,
+    })
 
     # Broadcast update via WebSocket
     node_updated = get_node(evidence_id)
@@ -411,6 +441,80 @@ async def get_forensic_results(case_id: str, evidence_id: str):
         raise HTTPException(status_code=404, detail="No forensic analysis available for this evidence")
 
     return forensics
+
+
+def _determine_authenticity(forensic_results: dict[str, Any]) -> str:
+    """Determine evidence authenticity based on forensic scores."""
+    auth_score = forensic_results.get("authenticity_score", 75)
+    deepfake_prob = forensic_results.get("deepfake_probability", 0)
+    manipulation_prob = forensic_results.get("manipulation_probability", 0)
+    
+    # High confidence authentic
+    if auth_score >= 85 and deepfake_prob < 10 and manipulation_prob < 15:
+        return "verified"
+    
+    # High suspicion
+    elif auth_score < 60 or deepfake_prob > 30 or manipulation_prob > 40:
+        return "suspicious"
+    
+    # Default to unknown (needs review)
+    else:
+        return "unknown"
+
+
+async def _extract_media_key_points(
+    media_url: str,
+    media_type: str,
+    forensic_results: dict[str, Any],
+    evidence_context: dict[str, Any]
+) -> list[str]:
+    """Extract key points from media based on forensic analysis and AI description."""
+    from app.services import backboard_client, twelvelabs
+    
+    key_points = []
+    
+    # Add forensic findings as key points
+    indicators = forensic_results.get("manipulation_indicators", [])
+    if indicators:
+        for indicator in indicators[:3]:  # Top 3
+            if "API unavailable" not in indicator and "manual review" not in indicator:
+                key_points.append(f"Forensic finding: {indicator}")
+    
+    # Add authenticity insight
+    auth_score = forensic_results.get("authenticity_score", 0)
+    if auth_score >= 85:
+        key_points.append(f"High authenticity score ({auth_score:.1f}%)")
+    elif auth_score < 60:
+        key_points.append(f"Low authenticity score ({auth_score:.1f}%) - requires review")
+    
+    # For images: Get AI description
+    if media_type == "image":
+        try:
+            description = await backboard_client.describe_image(media_url, evidence_context)
+            if description:
+                key_points.append(f"Visual content: {description}")
+        except Exception as e:
+            logger.warning(f"Failed to get image description: {e}")
+    
+    # For videos: Get summary
+    elif media_type == "video":
+        try:
+            summary = await twelvelabs.summarize_video(media_url)
+            if summary:
+                # Split summary into key points (first 3 sentences)
+                sentences = [s.strip() for s in summary.split('. ') if s.strip()][:3]
+                key_points.extend(sentences)
+        except Exception as e:
+            logger.warning(f"Failed to get video summary: {e}")
+    
+    # Add context-based insights
+    if evidence_context.get("location"):
+        loc = evidence_context["location"]
+        if isinstance(loc, dict) and loc.get("building"):
+            key_points.append(f"Location: {loc['building']}")
+    
+    # Limit to 5 key points max
+    return key_points[:5]
 
 
 def _is_image(file_path: str) -> bool:
