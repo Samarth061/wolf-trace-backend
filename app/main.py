@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.event_bus import start_event_bus, stop_event_bus
-from app.routers import reports, cases, alerts, ws, seed
+from app.routers import reports, cases, alerts, ws, seed, files
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -68,6 +68,7 @@ app.include_router(cases.router)
 app.include_router(alerts.router)
 app.include_router(ws.router)
 app.include_router(seed.router)
+app.include_router(files.router)
 
 
 @app.get("/health")
