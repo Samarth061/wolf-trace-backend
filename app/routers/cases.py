@@ -149,9 +149,13 @@ async def mark_evidence_reviewed(
     if node.case_id != case_id:
         raise HTTPException(status_code=400, detail="Evidence does not belong to this case")
 
-    # Update reviewed status
+    # Update reviewed status and confidence
     reviewed = body.get("reviewed", False)
-    update_node(evidence_id, {"reviewed": reviewed})
+    update_data = {
+        "reviewed": reviewed,
+        "confidence": 1.0 if reviewed else node.data.get("confidence", 0.0)  # 100% when reviewed
+    }
+    update_node(evidence_id, update_data)
 
     # Broadcast update via WebSocket
     node_updated = get_node(evidence_id)
@@ -166,7 +170,7 @@ async def mark_evidence_reviewed(
         except Exception as e:
             logger.warning(f"Failed to update evidence in Neo4j: {e}")
 
-    return {"id": evidence_id, "reviewed": reviewed}
+    return {"id": evidence_id, "reviewed": reviewed, "confidence": update_data["confidence"]}
 
 
 @router.get("/cases/{case_id}/evidence/{evidence_id}/inference")
@@ -238,8 +242,28 @@ async def get_evidence_inference(case_id: str, evidence_id: str):
     node_data = node.data or {}
     ai_analysis = node_data.get("ai_analysis", {})
 
+    # Calculate summary statistics
+    total_connections = len(inferences)
+    total_confidence = sum(inf["confidence"] for inf in inferences)
+    avg_confidence = total_confidence / total_connections if total_connections > 0 else 0.0
+
+    # Find strongest connection
+    strongest = max(inferences, key=lambda x: x["confidence"]) if inferences else None
+
+    # Count connection types
+    connection_types = {}
+    for inf in inferences:
+        edge_type = inf["type"]
+        connection_types[edge_type] = connection_types.get(edge_type, 0) + 1
+
     return {
         "evidence_id": evidence_id,
+        "summary": {
+            "total_connections": total_connections,
+            "avg_confidence": avg_confidence,
+            "strongest_connection": strongest["target_id"] if strongest else None,
+            "connection_types": connection_types,
+        },
         "inferences": inferences,
         "ai_analysis": ai_analysis,
     }
@@ -253,40 +277,240 @@ def _generate_connection_reasoning(
     edge_data: dict[str, Any],
 ) -> str:
     """Generate human-readable reasoning for why connection was made."""
+    # Build detailed reasoning with component scores
+    parts = []
+
+    # Temporal reasoning
+    if temporal_score > 0.8:
+        parts.append(f"occurred within minutes (temporal: {int(temporal_score*100)}%)")
+    elif temporal_score > 0.6:
+        parts.append(f"occurred within hours (temporal: {int(temporal_score*100)}%)")
+    elif temporal_score > 0.3:
+        parts.append(f"similar time period (temporal: {int(temporal_score*100)}%)")
+
+    # Geographic reasoning
+    if geo_score > 0.8:
+        parts.append(f"same location (geo: {int(geo_score*100)}%)")
+    elif geo_score > 0.5:
+        parts.append(f"nearby locations (geo: {int(geo_score*100)}%)")
+    elif geo_score > 0.3:
+        parts.append(f"same region (geo: {int(geo_score*100)}%)")
+
+    # Semantic reasoning
+    if semantic_score > 0.7:
+        parts.append(f"highly similar content (semantic: {int(semantic_score*100)}%)")
+    elif semantic_score > 0.4:
+        parts.append(f"related content (semantic: {int(semantic_score*100)}%)")
+    elif semantic_score > 0.2:
+        parts.append(f"loosely related (semantic: {int(semantic_score*100)}%)")
+
+    # Edge type specific reasoning
     if edge_type == "similar_to":
-        parts = []
-        if temporal_score > 0.7:
-            parts.append("reported within similar timeframe")
-        if geo_score > 0.7:
-            parts.append("geographically close")
-        if semantic_score > 0.7:
-            parts.append("semantically similar content")
-
-        if parts:
-            return "Evidence connected because: " + ", ".join(parts)
-        return "Evidence shows similarity patterns"
-
+        prefix = "Events "
     elif edge_type == "debunked_by":
-        return "Fact-check found claims in this evidence to be false"
-
+        return "Fact-check found claims in this evidence to be false. " + ("Events " + ", ".join(parts) if parts else "")
     elif edge_type == "contains":
-        return "Evidence contains related information"
-
+        prefix = "Evidence contains related information. "
     elif edge_type == "repost_of":
-        return "Evidence appears to be a repost of the original content"
-
+        return "Evidence appears to be a repost of the original content. " + ("Events " + ", ".join(parts) if parts else "")
     elif edge_type == "mutation_of":
-        return "Evidence shows signs of content manipulation or alteration"
-
+        return "Evidence shows signs of content manipulation or alteration. " + ("Events " + ", ".join(parts) if parts else "")
     elif edge_type == "amplified_by":
-        return "Evidence amplifies or spreads the original information"
+        prefix = "Evidence amplifies the original information. "
+    else:
+        prefix = "Events "
 
     # Manual connections
     if edge_data.get("manual"):
         notes = edge_data.get("notes", "")
         return f"Manually connected by officer{': ' + notes if notes else ''}"
 
-    return "AI-generated connection"
+    # Combine reasoning
+    if parts:
+        return prefix + ", ".join(parts)
+
+    return "Low confidence connection - manual review recommended"
+
+
+@router.post("/cases/{case_id}/evidence/{evidence_id}/forensics")
+async def analyze_forensics(case_id: str, evidence_id: str):
+    """Trigger forensic analysis on evidence with media (image or video)."""
+    from app.graph_state import get_node, update_node
+    from app.services import backboard_client, twelvelabs
+    from datetime import datetime
+
+    # Get the evidence node
+    node = get_node(evidence_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+
+    if node.case_id != case_id:
+        raise HTTPException(status_code=400, detail="Evidence does not belong to this case")
+
+    # Check if node has media
+    media_url = node.data.get("media_url", "")
+    if not media_url:
+        raise HTTPException(status_code=400, detail="No media attached to this evidence")
+
+    # Build evidence context for AI analysis
+    evidence_context = {
+        "claims": node.data.get("claims", []),
+        "entities": node.data.get("entities", []),
+        "location": node.data.get("location", {}),
+        "semantic_role": node.data.get("semantic_role"),
+        "timestamp": node.data.get("timestamp"),
+    }
+
+    # Determine media type and route to appropriate analysis
+    forensic_results: dict[str, Any] = {}
+
+    if _is_image(media_url):
+        logger.info(f"Analyzing image forensics for {evidence_id}")
+        forensic_results = await backboard_client.analyze_image_forensics(media_url, evidence_context)
+        forensic_results["media_type"] = "image"
+
+    elif _is_video(media_url):
+        logger.info(f"Analyzing video forensics for {evidence_id}")
+        forensic_results = await twelvelabs.detect_deepfake(media_url, evidence_context)
+        forensic_results["media_type"] = "video"
+
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported media type (must be image or video)")
+
+    # Add metadata
+    forensic_results["analyzed_at"] = datetime.utcnow().isoformat()
+    forensic_results["media_url"] = media_url
+
+    # Store in node.data.forensics
+    update_node(evidence_id, {"forensics": forensic_results})
+
+    # Broadcast update via WebSocket
+    node_updated = get_node(evidence_id)
+    if node_updated:
+        await broadcast_graph_update("update_node", node_updated.model_dump(mode="json"))
+
+    logger.info(f"Forensic analysis complete for {evidence_id}: {forensic_results.get('authenticity_score', 'N/A')}")
+
+    return forensic_results
+
+
+@router.get("/cases/{case_id}/evidence/{evidence_id}/forensics")
+async def get_forensic_results(case_id: str, evidence_id: str):
+    """Fetch existing forensic analysis results for evidence."""
+    from app.graph_state import get_node
+
+    node = get_node(evidence_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+
+    if node.case_id != case_id:
+        raise HTTPException(status_code=400, detail="Evidence does not belong to this case")
+
+    forensics = node.data.get("forensics")
+    if not forensics:
+        raise HTTPException(status_code=404, detail="No forensic analysis available for this evidence")
+
+    return forensics
+
+
+def _is_image(file_path: str) -> bool:
+    """Check if file is an image based on extension."""
+    image_extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff"]
+    return any(file_path.lower().endswith(ext) for ext in image_extensions)
+
+
+def _is_video(file_path: str) -> bool:
+    """Check if file is a video based on extension."""
+    video_extensions = [".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".mkv", ".m4v"]
+    return any(file_path.lower().endswith(ext) for ext in video_extensions)
+
+
+@router.delete("/cases/{case_id}/evidence/{evidence_id}")
+async def delete_evidence(case_id: str, evidence_id: str):
+    """Delete evidence node and cascade to connected edges."""
+    from app.graph_state import get_node, delete_node
+
+    # Validate evidence exists and belongs to case
+    node = get_node(evidence_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+
+    if node.case_id != case_id:
+        raise HTTPException(status_code=400, detail="Evidence does not belong to this case")
+
+    try:
+        # Delete node and connected edges
+        result = delete_node(evidence_id)
+
+        # Broadcast deletion via WebSocket
+        await broadcast_graph_update("delete_node", {
+            "node_id": evidence_id,
+            "case_id": case_id,
+        })
+
+        logger.info(f"Deleted evidence {evidence_id} and {result['deleted_edges']} connected edges")
+
+        return {
+            "status": "deleted",
+            "node_id": evidence_id,
+            "edges_deleted": result["deleted_edges"],
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/cases/{case_id}/chat")
+async def chat_with_evidence(case_id: str, body: dict[str, Any]):
+    """Chat with AI about evidence context using Backboard."""
+    from app.graph_state import get_node
+    from app.services import backboard_client
+    import json
+
+    message = body.get("message", "")
+    evidence_ids = body.get("evidence_ids", [])
+
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    # Gather evidence context
+    context = []
+    for eid in evidence_ids:
+        node = get_node(eid)
+        if node and node.case_id == case_id:
+            context.append({
+                "id": node.id,
+                "content": node.data.get("text_body", ""),
+                "claims": node.data.get("claims", []),
+                "forensics": node.data.get("forensics", {}),
+            })
+
+    # Build prompt with evidence context
+    prompt = f"""Evidence Context:\n{json.dumps(context, indent=2)}\n\nUser Question: {message}"""
+
+    # Send to Backboard (use Claim Analyst for general queries)
+    assistants = await backboard_client.get_or_create_assistants()
+
+    if not assistants or "claim_analyst" not in assistants:
+        raise HTTPException(status_code=503, detail="AI service unavailable")
+
+    # Get or create thread for this case
+    threads = await backboard_client.create_case_thread(case_id)
+    thread_id = threads.get("claim_analyst")
+
+    if not thread_id:
+        raise HTTPException(status_code=500, detail="Failed to create chat thread")
+
+    # Send message and get response
+    response = await backboard_client.send_to_agent(
+        "claim_analyst",
+        thread_id,
+        prompt,
+    )
+
+    return {
+        "response": response or "No response from AI",
+        "sources": evidence_ids,
+    }
 
 
 @router.post("/cases/{case_id}/edges")
@@ -359,3 +583,158 @@ async def create_edge(
 
     # Return in GraphEdge shape so frontend's mapBackendEdge works
     return edge.model_dump(mode="json")
+
+
+@router.get("/cases/{case_id}/story")
+async def get_case_story(case_id: str):
+    """Generate coherent narrative for the case using AI synthesis."""
+    from app.graph_state import get_nodes_for_case, get_edges_for_case
+    from app.services import ai as ai_service
+    from datetime import datetime
+
+    # Get all nodes for this case
+    nodes = get_nodes_for_case(case_id)
+    edges = get_edges_for_case(case_id)
+
+    # Filter to report nodes and sort by timestamp
+    reports = [n for n in nodes if n.node_type == NodeType.REPORT]
+    timeline = sorted(
+        reports,
+        key=lambda n: n.data.get("timestamp", datetime.now().isoformat())
+    )
+
+    if not timeline:
+        return {
+            "case_id": case_id,
+            "narrative": "No evidence has been added to this case yet.",
+            "sections": {},
+            "key_moments": [],
+        }
+
+    # Format timeline for AI
+    timeline_text = []
+    for i, node in enumerate(timeline, 1):
+        timestamp = node.data.get("timestamp", "Unknown time")
+        text_body = node.data.get("text_body", "No description")
+        title = node.data.get("title", f"Evidence {i}")
+        timeline_text.append(f"{i}. [{timestamp}] {title}: {text_body[:200]}")
+
+    # Format connections for AI
+    connections_text = []
+    for edge in edges:
+        source_node = next((n for n in nodes if n.id == edge.source_id), None)
+        target_node = next((n for n in nodes if n.id == edge.target_id), None)
+        if source_node and target_node:
+            source_title = source_node.data.get("title", edge.source_id)
+            target_title = target_node.data.get("title", edge.target_id)
+            connections_text.append(
+                f"- {source_title} → {edge.edge_type.value} → {target_title}"
+            )
+
+    # Generate narrative using AI
+    story_prompt = f"""Generate a coherent narrative for this investigation case.
+
+Timeline of Events:
+{chr(10).join(timeline_text)}
+
+Connections:
+{chr(10).join(connections_text[:20])}
+
+Generate a narrative with these sections:
+1. **Origin**: How the case started (1-2 sentences)
+2. **Progression**: How it evolved over time (2-3 sentences)
+3. **Current Status**: Where things stand now (1-2 sentences)
+
+Also identify 2-3 key turning points in the investigation.
+
+Keep the narrative factual, concise, and focused on the evidence timeline."""
+
+    try:
+        # Use AI service to generate narrative
+        narrative = await ai_service.query_with_context(story_prompt)
+
+        # Extract sections from narrative (simple parsing)
+        sections = _parse_narrative_sections(narrative)
+
+        # Identify key moments
+        key_moments = _identify_key_moments(timeline, edges)
+
+        return {
+            "case_id": case_id,
+            "narrative": narrative,
+            "sections": sections,
+            "key_moments": key_moments,
+        }
+    except Exception as e:
+        logger.error(f"Story generation failed: {e}")
+        # Fallback to simple concatenation
+        fallback_narrative = f"Case involves {len(timeline)} pieces of evidence collected over time. "
+        if edges:
+            fallback_narrative += f"Evidence shows {len(edges)} connections between reports. "
+        fallback_narrative += "Manual review recommended for complete understanding."
+
+        return {
+            "case_id": case_id,
+            "narrative": fallback_narrative,
+            "sections": {},
+            "key_moments": [],
+        }
+
+
+def _parse_narrative_sections(narrative: str) -> dict[str, str]:
+    """Parse narrative into sections (simple implementation)."""
+    sections = {}
+    current_section = None
+    current_text = []
+
+    for line in narrative.split("\n"):
+        if "**Origin" in line or "Origin:" in line:
+            if current_section:
+                sections[current_section] = " ".join(current_text)
+            current_section = "origin"
+            current_text = []
+        elif "**Progression" in line or "Progression:" in line:
+            if current_section:
+                sections[current_section] = " ".join(current_text)
+            current_section = "progression"
+            current_text = []
+        elif "**Current" in line or "Status:" in line:
+            if current_section:
+                sections[current_section] = " ".join(current_text)
+            current_section = "status"
+            current_text = []
+        elif line.strip() and current_section:
+            current_text.append(line.strip())
+
+    if current_section:
+        sections[current_section] = " ".join(current_text)
+
+    return sections
+
+
+def _identify_key_moments(timeline: list, edges: list) -> list[dict[str, str]]:
+    """Identify key moments based on evidence with many connections."""
+    # Find nodes with the most connections
+    connection_counts = {}
+    for edge in edges:
+        connection_counts[edge.source_id] = connection_counts.get(edge.source_id, 0) + 1
+        connection_counts[edge.target_id] = connection_counts.get(edge.target_id, 0) + 1
+
+    # Sort timeline by connection count
+    key_nodes = sorted(
+        timeline,
+        key=lambda n: connection_counts.get(n.id, 0),
+        reverse=True
+    )[:3]  # Top 3 most connected
+
+    moments = []
+    for node in key_nodes:
+        title = node.data.get("title", "Evidence")
+        description = node.data.get("text_body", "")[:100]
+        connection_count = connection_counts.get(node.id, 0)
+        moments.append({
+            "description": f"{title} - {connection_count} connections",
+            "detail": description,
+        })
+
+    return moments

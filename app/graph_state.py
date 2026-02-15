@@ -90,6 +90,42 @@ def update_node(node_id: str, data_updates: dict[str, Any]) -> None:
         _nodes[node_id].data.update(data_updates)
 
 
+def delete_node(node_id: str) -> dict[str, Any]:
+    """Delete node and cascade to connected edges."""
+    if node_id not in _nodes:
+        raise ValueError(f"Node {node_id} not found")
+
+    # Find all connected edges
+    edges_to_delete = [
+        e for e in _edges
+        if e.source_id == node_id or e.target_id == node_id
+    ]
+
+    # Delete edges first
+    for edge in edges_to_delete:
+        _edges.remove(edge)
+
+    # Remove from adjacency
+    _adjacency.pop(node_id, None)
+    for neighbors in _adjacency.values():
+        if node_id in neighbors:
+            neighbors.remove(node_id)
+
+    # Remove from case reports tracking
+    for case_id, report_ids in _case_reports.items():
+        if node_id in report_ids:
+            report_ids.remove(node_id)
+
+    # Delete node
+    node = _nodes.pop(node_id)
+
+    return {
+        "deleted_node": node_id,
+        "deleted_edges": len(edges_to_delete),
+        "edge_ids": [e.id for e in edges_to_delete],
+    }
+
+
 def get_node(node_id: str) -> GraphNode | None:
     return _nodes.get(node_id)
 
