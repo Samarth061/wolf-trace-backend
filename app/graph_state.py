@@ -445,8 +445,10 @@ def create_and_add_node(
     node_id: str | None = None,
 ) -> GraphNode:
     nid = node_id or generate_node_id(prefix=node_type.value[:1].upper())
+    logger.info(f"Creating node {nid} of type {node_type.value} for case {case_id}")
     node = GraphNode(id=nid, node_type=node_type, case_id=case_id, data=data)
     add_node(node)
+    logger.info(f"Node {nid} created successfully, will be broadcast")
     return node
 
 

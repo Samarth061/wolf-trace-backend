@@ -53,11 +53,19 @@ async def _retry_api_call(coro_func, max_retries: int = 3, backoff_base: float =
     return None
 
 
-async def run_forensics(case_id: str, report_node_id: str, media_url: str | None) -> None:
+async def run_forensics(
+    case_id: str,
+    report_node_id: str,
+    media_url: str | None,
+    llm_provider: str = "default"
+) -> None:
     """
     If image: ELA, pHash, EXIF. Compare pHash vs all media.
     If video: TwelveLabs index + summarize.
     Add MediaVariant nodes and REPOST_OF/MUTATION_OF edges.
+
+    Args:
+        llm_provider: LLM provider for text processing (groq/default)
     """
     if not media_url:
         return
@@ -69,12 +77,17 @@ async def run_forensics(case_id: str, report_node_id: str, media_url: str | None
     )
 
     if is_video:
-        await _process_video(case_id, report_node_id, media_url)
+        await _process_video(case_id, report_node_id, media_url, llm_provider)
     else:
-        await _process_image(case_id, report_node_id, media_url)
+        await _process_image(case_id, report_node_id, media_url, llm_provider)
 
 
-async def _process_image(case_id: str, report_node_id: str, media_url: str) -> None:
+async def _process_image(
+    case_id: str,
+    report_node_id: str,
+    media_url: str,
+    llm_provider: str = "default"
+) -> None:
     """Process image: ELA, pHash, EXIF, Backboard AI analysis, compare with existing."""
     # Traditional forensics
     analysis = analyze_media_from_url(media_url)
@@ -96,13 +109,17 @@ async def _process_image(case_id: str, report_node_id: str, media_url: str) -> N
         logger.warning(f"Could not get report node context: {e}")
         evidence_context = {}
 
-    # AI-powered forensic analysis using Backboard vision
+    # AI-powered forensic analysis using GROQ or Backboard vision
     ai_scores = {}
     try:
         # Retry Backboard API call with exponential backoff
         async def call_backboard():
-            return await backboard_client.analyze_image_forensics(media_url, evidence_context)
-        
+            return await backboard_client.analyze_image_forensics(
+                media_url,
+                evidence_context,
+                llm_provider=llm_provider
+            )
+
         ai_scores = await _retry_api_call(call_backboard, max_retries=3, backoff_base=1.0)
         
         if ai_scores:
@@ -165,7 +182,12 @@ async def _process_image(case_id: str, report_node_id: str, media_url: str) -> N
         await broadcast_graph_update("update_node", updated.model_dump(mode="json"))
 
 
-async def _process_video(case_id: str, report_node_id: str, media_url: str) -> None:
+async def _process_video(
+    case_id: str,
+    report_node_id: str,
+    media_url: str,
+    llm_provider: str = "default"
+) -> None:
     """Process video: TwelveLabs index, search, summarize, deepfake detection. Create MediaVariant node."""
     # Get report node for evidence context
     try:

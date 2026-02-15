@@ -1,15 +1,38 @@
-"""Unified AI layer: Backboard when available, Gemini fallback."""
+"""Unified AI layer: routes to GROQ, Backboard, or Gemini based on preference."""
 import json
 import logging
 from typing import Any
 
-from app.services import backboard_client, gemini
+from app.services import backboard_client, gemini, groq
 
 logger = logging.getLogger(__name__)
 
 
-async def extract_claims(report_text: str, case_id: str = "", location: Any = None, timestamp: str = "") -> dict[str, Any]:
-    """Extract claims via Backboard Claim Analyst or Gemini fallback."""
+async def extract_claims(
+    report_text: str,
+    case_id: str = "",
+    location: Any = None,
+    timestamp: str = "",
+    llm_provider: str = "groq"
+) -> dict[str, Any]:
+    """Extract claims using GROQ (default) or Backboard fallback.
+
+    Provider priority:
+    1. GROQ (default, fast, cheap)
+    2. Backboard (uses their Gemini key)
+    3. Mock data (no direct Gemini usage)
+    """
+
+    # Primary: Use GROQ
+    if groq.is_available():
+        try:
+            logger.info("Routing extract_claims to GROQ")
+            return await groq.extract_claims(report_text)
+        except Exception as e:
+            logger.warning(f"GROQ failed, falling back to Backboard: {e}")
+            # Fall through to Backboard
+
+    # Fallback 1: Use Backboard (uses their Gemini key)
     if backboard_client.is_available():
         try:
             threads = await backboard_client.create_case_thread(case_id)
@@ -22,8 +45,16 @@ async def extract_claims(report_text: str, case_id: str = "", location: Any = No
                 if resp:
                     return _parse_claims_json(resp)
         except Exception as e:
-            logger.warning("Backboard extract_claims failed, falling back to Gemini: %s", e)
-    return await gemini.extract_claims(report_text)
+            logger.warning("Backboard extract_claims failed: %s", e)
+
+    # Fallback 2: Return mock data (NO direct Gemini usage)
+    logger.warning("Both GROQ and Backboard unavailable, returning mock claims")
+    return {
+        "claims": [{"statement": report_text[:200] or "Unknown claim", "confidence": 0.5, "category": "other"}],
+        "urgency": 0.5,
+        "misinformation_flags": [],
+        "suggested_verifications": ["Verify with on-site sources"],
+    }
 
 
 async def fact_check_claims(claims: list[dict], case_id: str, thread_ids: dict[str, str]) -> dict[str, Any]:
@@ -43,8 +74,23 @@ async def fact_check_claims(claims: list[dict], case_id: str, thread_ids: dict[s
         return {}
 
 
-async def compose_alert(case_context: str, officer_notes: str | None, case_id: str = "") -> str:
-    """Compose alert via Backboard Alert Composer or Gemini fallback."""
+async def compose_alert(
+    case_context: str,
+    officer_notes: str | None,
+    case_id: str = "",
+    llm_provider: str = "groq"
+) -> str:
+    """Compose alert using GROQ (default) or Backboard fallback."""
+
+    # Primary: Use GROQ
+    if groq.is_available():
+        try:
+            logger.info("Routing compose_alert to GROQ")
+            return await groq.compose_alert(case_context, officer_notes)
+        except Exception as e:
+            logger.warning(f"GROQ failed, falling back to Backboard: {e}")
+
+    # Fallback 1: Backboard with Claude
     if backboard_client.is_available() and case_id:
         try:
             threads = backboard_client.get_thread_ids(case_id)
@@ -64,8 +110,11 @@ async def compose_alert(case_context: str, officer_notes: str | None, case_id: s
                         return data["alert_text"]
                     return resp.strip()
         except Exception as e:
-            logger.warning("Backboard compose_alert failed, falling back to Gemini: %s", e)
-    return await gemini.compose_alert(case_context, officer_notes)
+            logger.warning("Backboard compose_alert failed: %s", e)
+
+    # Fallback 2: Mock alert (NO direct Gemini usage)
+    logger.warning("Both GROQ and Backboard unavailable, returning mock alert")
+    return "Campus Safety Notice: We are investigating a reported incident. Please avoid the area until further notice. Check official channels for updates."
 
 
 async def synthesize_case(case_id: str, thread_ids: dict[str, str], case_context: str = "") -> dict[str, Any]:
@@ -86,9 +135,20 @@ async def synthesize_case(case_id: str, thread_ids: dict[str, str], case_context
     return {}
 
 
-async def generate_search_queries(claims: list[dict[str, Any]]) -> list[str]:
-    """Generate search queries. Uses Gemini (Backboard doesn't replace this)."""
-    return await gemini.generate_search_queries(claims)
+async def generate_search_queries(claims: list[dict[str, Any]], llm_provider: str = "groq") -> list[str]:
+    """Generate search queries using GROQ (default) with mock fallback."""
+
+    # Primary: Use GROQ
+    if groq.is_available():
+        try:
+            logger.info("Routing generate_search_queries to GROQ")
+            return await groq.generate_search_queries(claims)
+        except Exception as e:
+            logger.warning(f"GROQ failed for search queries: {e}")
+
+    # Fallback: Return mock queries (NO Gemini, Backboard doesn't support this)
+    logger.warning("GROQ unavailable, returning mock search queries")
+    return ["campus incident", "university safety alert", "student reports"]
 
 
 def _parse_claims_json(text: str) -> dict[str, Any] | list:

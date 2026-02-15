@@ -290,17 +290,49 @@ def _resolve_media_to_local_path(media_url: str) -> Path | None:
     return None
 
 
-async def analyze_image_forensics(image_url: str, evidence_context: dict[str, Any]) -> dict[str, Any]:
+async def analyze_image_forensics(
+    image_url: str,
+    evidence_context: dict[str, Any],
+    llm_provider: str = "groq"
+) -> dict[str, Any]:
     """
-    Analyze image authenticity using Backboard vision capabilities.
+    Analyze image authenticity using GROQ (default) or Backboard vision fallback.
 
     Args:
         image_url: URL to the image file
         evidence_context: Dict with claims, entities, location, semantic_role, timestamp
+        llm_provider: LLM provider for forensic scoring ("groq" or "default")
 
     Returns:
         Dict with authenticity_score, manipulation_probability, quality_score, etc.
     """
+    # Primary: Use GROQ for forensic scoring (text-based analysis)
+    from app.services import groq
+
+    if groq.is_available():
+        logger.info("Using GROQ for forensic scoring (text-based analysis)")
+
+        # Get image description from Backboard vision (free, no quota)
+        description = await describe_image(image_url, evidence_context)
+
+        if description:
+            # Use GROQ for forensic scoring
+            ai_scores = await groq.analyze_image_forensics_from_description(
+                description, evidence_context
+            )
+
+            if ai_scores and ai_scores.get("ml_accuracy", 0) > 0:
+                return ai_scores
+            else:
+                logger.warning("GROQ forensic scoring failed, falling back to Backboard vision")
+        else:
+            logger.warning("Backboard describe_image failed, falling back to Backboard vision")
+    else:
+        logger.warning("GROQ unavailable, falling back to Backboard vision")
+
+    # Fallback: Use Backboard Gemini vision (existing code continues below)
+    logger.info("Using Backboard Gemini vision for forensic analysis")
+
     client = _get_client()
     assistants = await get_or_create_assistants()
 
@@ -332,12 +364,15 @@ Analyze and provide:
 3. Quality Score (0-100): Image quality and resolution
 4. Manipulation Indicators: List specific signs of manipulation
 5. Context Consistency: Does image match the reported context?
+6. ML Accuracy (0-100): Your confidence in this forensic analysis based on image quality,
+   clarity of indicators, and ability to detect manipulation signs
 
 Return JSON format ONLY (no markdown, no preamble):
 {{
   "authenticity_score": 85.5,
   "manipulation_probability": 12.3,
   "quality_score": 91.0,
+  "ml_accuracy": 87.5,
   "manipulation_indicators": ["minor JPEG artifacts", "EXIF metadata intact"],
   "context_consistency": "high",
   "reasoning": "detailed analysis..."
@@ -380,6 +415,13 @@ Return JSON format ONLY (no markdown, no preamble):
         result = _parse_json(response_text)
 
         if isinstance(result, dict) and "authenticity_score" in result:
+            # If ml_accuracy not provided by Gemini, calculate composite
+            if "ml_accuracy" not in result or result.get("ml_accuracy", 0) == 0:
+                result["ml_accuracy"] = (
+                    (result.get("authenticity_score", 65.0) * 0.5) +
+                    (result.get("quality_score", 70.0) * 0.3) +
+                    ((100 - result.get("manipulation_probability", 25.0)) * 0.2)
+                )
             return result
         else:
             logger.warning("Invalid forensic analysis response format. Response (truncated): %s", (response_text or "")[:500])

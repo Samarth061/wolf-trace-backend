@@ -198,12 +198,25 @@ Look for signs of deepfake technology or video manipulation."""
         # 6. Get summary
         summary = await summarize_video(video_url)
 
+        # 7. Calculate ml_accuracy from search result confidence scores
+        if search_results:
+            # TwelveLabs returns confidence/score for each search result
+            # Average the top 5 results' confidence scores
+            top_results = search_results[:5]
+            confidences = [r.get("confidence", r.get("score", 0.7)) for r in top_results]
+            ml_accuracy = sum(confidences) / len(confidences) if confidences else 0.7
+            # Convert to 0-100 range if in 0-1 range
+            if ml_accuracy <= 1.0:
+                ml_accuracy = ml_accuracy * 100
+        else:
+            ml_accuracy = 70.0  # Default if no search results
+
         return {
             "deepfake_probability": deepfake_probability,
             "manipulation_probability": manipulation_probability,
             "quality_score": quality_score,
             "authenticity_score": authenticity_score,
-            "ml_accuracy": 0.94,  # TwelveLabs Marengo model accuracy
+            "ml_accuracy": ml_accuracy,
             "indicators": _extract_indicators(search_results),
             "summary": summary or "No summary available",
             "video_id": video_id,

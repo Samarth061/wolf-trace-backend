@@ -11,6 +11,7 @@ class Settings(BaseSettings):
 
     gemini_api_key: str = ""
     backboard_api_key: str = ""
+    groq_api_key: str = ""
     neo4j_uri: str = ""
     neo4j_username: str = ""
     neo4j_password: str = ""

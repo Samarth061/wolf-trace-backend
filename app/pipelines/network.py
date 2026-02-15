@@ -33,12 +33,19 @@ async def run_network(
     report_text: str,
     location: Any = None,
     timestamp: str = "",
+    llm_provider: str = "default",
 ) -> None:
     """
     Extract claims, fact-check, generate search queries. Store all in report node data.
     No separate fact_check or external_source nodes. Confidence derived from fact check ratings.
     """
-    extracted = await ai.extract_claims(report_text, case_id=case_id, location=location, timestamp=timestamp)
+    extracted = await ai.extract_claims(
+        report_text,
+        case_id=case_id,
+        location=location,
+        timestamp=timestamp,
+        llm_provider=llm_provider
+    )
     claims = extracted.get("claims", [])
     urgency = extracted.get("urgency", 0.5)
     misinformation_flags = extracted.get("misinformation_flags", [])
@@ -66,7 +73,7 @@ async def run_network(
                 "url": url,
             })
 
-    queries = await ai.generate_search_queries(claims)
+    queries = await ai.generate_search_queries(claims, llm_provider=llm_provider)
     search_queries = [{"query": q, "platform": "web", "status": "pending"} for q in queries]
 
     fc_confidence = _confidence_from_fact_checks(fact_checks)

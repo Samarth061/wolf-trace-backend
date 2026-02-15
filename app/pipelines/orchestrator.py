@@ -33,17 +33,25 @@ def register_knowledge_sources() -> BlackboardController:
     async def _forensics_handler(payload: dict[str, Any]) -> None:
         node_id = payload.get("report_node_id") or payload.get("node_id") or payload.get("id", "")
         media_url = payload.get("media_url") or (payload.get("data") or {}).get("media_url")
-        await forensics.run_forensics(payload["case_id"], node_id, media_url)
+        llm_provider = (payload.get("data") or {}).get("llm_provider", "default")  # NEW: Get LLM preference
+        await forensics.run_forensics(
+            payload["case_id"],
+            node_id,
+            media_url,
+            llm_provider=llm_provider  # NEW: Pass to forensics pipeline
+        )
 
     async def _network_handler(payload: dict[str, Any]) -> None:
         node_id = payload.get("report_node_id") or payload.get("node_id") or payload.get("id", "")
         node_data = payload.get("data", payload)
+        llm_provider = payload.get("llm_provider", "default")  # NEW: Get LLM preference from payload
         await network.run_network(
             payload["case_id"],
             node_id,
             node_data.get("text_body", ""),
             location=node_data.get("location"),
             timestamp=node_data.get("timestamp", ""),
+            llm_provider=llm_provider,  # NEW: Pass to network pipeline
         )
 
     def _has_media(p: dict[str, Any]) -> bool:

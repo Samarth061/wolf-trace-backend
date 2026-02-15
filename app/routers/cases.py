@@ -3,7 +3,7 @@ import logging
 from typing import Any
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from neo4j import Session as Neo4jSession
 
 from app.event_bus import emit
@@ -96,6 +96,7 @@ async def get_case(case_id: str):
 async def add_evidence(
     case_id: str,
     body: EvidenceCreate,
+    request: Request,
     session: Neo4jSession | None = Depends(GraphDatabase.get_optional_session),
 ):
     """Upload raw evidence; saves to Neo4j if available, adds to in-memory graph, returns GraphNode shape."""
@@ -103,7 +104,10 @@ async def add_evidence(
     import uuid
     if not body.id:
         body.id = f"ev-{int(datetime.utcnow().timestamp() * 1000)}-{uuid.uuid4().hex[:6]}"
-    
+
+    # Extract LLM provider preference from header
+    llm_provider = request.headers.get("X-LLM-Provider", "default")
+
     evidence_data = {
         "id": body.id,
         "type": body.type,
@@ -129,6 +133,10 @@ async def add_evidence(
         "media_url": body.url or "",
         "timestamp": body.timestamp or "",
         "reviewed": False,
+        "confidence": 0.7,  # Default 70% for investigator-submitted evidence
+        "semantic_role": "evidence",  # Will be updated by Classifier pipeline
+        "role_confidence": 0.5,
+        "llm_provider": llm_provider,  # NEW: Pass LLM preference to pipelines
     }
     node = create_and_add_node(node_type, case_id, node_data, node_id=body.id)
     await broadcast_graph_update("add_node", node.model_dump(mode="json"))
@@ -358,6 +366,10 @@ async def analyze_forensics(case_id: str, evidence_id: str):
     if not media_url:
         raise HTTPException(status_code=400, detail="No media attached to this evidence")
 
+    # NEW: Read LLM provider preference from node data
+    llm_provider = node.data.get("llm_provider", "default")
+    logger.info(f"Forensics using LLM provider: {llm_provider}")
+
     # Build evidence context for AI analysis
     evidence_context = {
         "claims": node.data.get("claims", []),
@@ -369,16 +381,25 @@ async def analyze_forensics(case_id: str, evidence_id: str):
 
     # Determine media type and route to appropriate analysis
     forensic_results: dict[str, Any] = {}
+    using_fallback = False
 
     if _is_image(media_url):
         logger.info(f"Analyzing image forensics for {evidence_id}")
-        forensic_results = await backboard_client.analyze_image_forensics(media_url, evidence_context)
+        forensic_results = await backboard_client.analyze_image_forensics(
+            media_url,
+            evidence_context,
+            llm_provider=llm_provider
+        )
         forensic_results["media_type"] = "image"
+        # Check if fallback scores were used (ml_accuracy == 0 from fallback)
+        using_fallback = (forensic_results.get("ml_accuracy", 0) == 0.0)
 
     elif _is_video(media_url):
         logger.info(f"Analyzing video forensics for {evidence_id}")
         forensic_results = await twelvelabs.detect_deepfake(media_url, evidence_context)
         forensic_results["media_type"] = "video"
+        # TwelveLabs fallback has ml_accuracy: 0.0
+        using_fallback = (forensic_results.get("ml_accuracy", 0) == 0.0)
 
     else:
         raise HTTPException(status_code=400, detail="Unsupported media type (must be image or video)")
@@ -386,6 +407,8 @@ async def analyze_forensics(case_id: str, evidence_id: str):
     # Add metadata
     forensic_results["analyzed_at"] = datetime.utcnow().isoformat()
     forensic_results["media_url"] = media_url
+    forensic_results["status"] = "fallback" if using_fallback else "success"
+    forensic_results["analysis_method"] = "backboard" if _is_image(media_url) else "twelvelabs"
     
     # Add 'indicators' as alias for 'manipulation_indicators' for frontend compatibility
     if "manipulation_indicators" in forensic_results and "indicators" not in forensic_results:
@@ -399,12 +422,23 @@ async def analyze_forensics(case_id: str, evidence_id: str):
         media_url,
         forensic_results.get("media_type", "image"),
         forensic_results,
-        evidence_context
+        evidence_context,
+        llm_provider=llm_provider  # NEW: Pass LLM provider
     )
     
     # Calculate confidence score (ml_accuracy as 0-1 score)
     ml_accuracy = forensic_results.get("ml_accuracy", 0.0)
-    confidence = ml_accuracy / 100.0 if ml_accuracy > 1 else ml_accuracy
+    if ml_accuracy > 1.0:
+        # ml_accuracy in 0-100 range, normalize to 0-1
+        confidence = ml_accuracy / 100.0
+    else:
+        # Already in 0-1 range
+        confidence = ml_accuracy
+
+    # Fallback to authenticity_score if ml_accuracy is 0
+    if confidence == 0.0:
+        authenticity_score = forensic_results.get("authenticity_score", 0.0)
+        confidence = authenticity_score / 100.0 if authenticity_score > 0 else 0.5
 
     # Store forensics, authenticity, key_points, and confidence in node data
     update_node(evidence_id, {
@@ -466,10 +500,11 @@ async def _extract_media_key_points(
     media_url: str,
     media_type: str,
     forensic_results: dict[str, Any],
-    evidence_context: dict[str, Any]
+    evidence_context: dict[str, Any],
+    llm_provider: str = "default"  # NEW: LLM provider for text processing
 ) -> list[str]:
     """Extract key points from media based on forensic analysis and AI description."""
-    from app.services import backboard_client, twelvelabs
+    from app.services import backboard_client, twelvelabs, ai
     
     key_points = []
     
@@ -487,12 +522,28 @@ async def _extract_media_key_points(
     elif auth_score < 60:
         key_points.append(f"Low authenticity score ({auth_score:.1f}%) - requires review")
     
-    # For images: Get AI description
+    # For images: Get AI description and extract claims using configured LLM
     if media_type == "image":
         try:
             description = await backboard_client.describe_image(media_url, evidence_context)
             if description:
-                key_points.append(f"Visual content: {description}")
+                # Route claim extraction based on provider preference
+                logger.info(f"Processing image description with LLM provider: {llm_provider}")
+                claims_result = await ai.extract_claims(
+                    description,
+                    llm_provider=llm_provider
+                )
+
+                # Extract key points from claims
+                claims = claims_result.get("claims", [])
+                for claim in claims[:3]:  # Top 3 claims
+                    statement = claim.get("statement", "")
+                    if statement:
+                        key_points.append(f"Visual claim: {statement}")
+
+                # If no claims extracted, fallback to raw description
+                if not claims:
+                    key_points.append(f"Visual content: {description}")
         except Exception as e:
             logger.warning(f"Failed to get image description: {e}")
     
