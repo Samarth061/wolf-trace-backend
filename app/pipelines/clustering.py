@@ -59,7 +59,7 @@ async def run_clustering(
     report_text = report_data.get("text_body", "").lower()
     report_keywords = set(w for w in report_text.split() if len(w) > 3)
 
-    best_match: tuple[str, float] | None = None
+    best_match: tuple[str, float, dict[str, float]] | None = None
     best_score = 0.0
 
     for existing in get_all_reports():
@@ -105,16 +105,26 @@ async def run_clustering(
         if combined >= SIMILARITY_THRESHOLD and combined > best_score:
             exist_node_id = existing.get("report_node_id") or existing.get("report_id")
             if exist_node_id and get_node(exist_node_id):
-                best_match = (exist_node_id, combined)
+                component_scores = {
+                    "temporal_score": temporal_score,
+                    "geo_score": geo_score,
+                    "semantic_score": semantic_score,
+                }
+                best_match = (exist_node_id, combined, component_scores)
                 best_score = combined
 
     if best_match:
-        other_node_id, score = best_match
+        other_node_id, score, components = best_match
         edge = create_and_add_edge(
             EdgeType.SIMILAR_TO,
             report_node_id,
             other_node_id,
             case_id,
-            {"confidence": score},
+            {
+                "confidence": score,
+                "temporal_score": components["temporal_score"],
+                "geo_score": components["geo_score"],
+                "semantic_score": components["semantic_score"],
+            },
         )
         await broadcast_graph_update("add_edge", edge.model_dump(mode="json"))

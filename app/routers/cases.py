@@ -1,5 +1,6 @@
 """Cases router: GET/POST /api/cases, GET/POST /api/cases/{case_id}, evidence, edges."""
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from neo4j import Session as Neo4jSession
@@ -130,6 +131,164 @@ async def add_evidence(
     return node.model_dump(mode="json")
 
 
+@router.patch("/cases/{case_id}/evidence/{evidence_id}")
+async def mark_evidence_reviewed(
+    case_id: str,
+    evidence_id: str,
+    body: dict[str, Any],
+    session: Neo4jSession | None = Depends(GraphDatabase.get_optional_session),
+):
+    """Mark evidence as reviewed by investigator."""
+    from app.graph_state import get_node, update_node
+
+    # Update in-memory graph
+    node = get_node(evidence_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+
+    if node.case_id != case_id:
+        raise HTTPException(status_code=400, detail="Evidence does not belong to this case")
+
+    # Update reviewed status
+    reviewed = body.get("reviewed", False)
+    update_node(evidence_id, {"reviewed": reviewed})
+
+    # Broadcast update via WebSocket
+    node_updated = get_node(evidence_id)
+    if node_updated:
+        await broadcast_graph_update("update_node", node_updated.model_dump(mode="json"))
+
+    # Optional: Persist to Neo4j if configured
+    if session is not None:
+        try:
+            # TODO: Add Neo4j update query when needed
+            logger.debug(f"Neo4j update for reviewed status: {evidence_id}")
+        except Exception as e:
+            logger.warning(f"Failed to update evidence in Neo4j: {e}")
+
+    return {"id": evidence_id, "reviewed": reviewed}
+
+
+@router.get("/cases/{case_id}/evidence/{evidence_id}/inference")
+async def get_evidence_inference(case_id: str, evidence_id: str):
+    """Get AI inference results and reasoning for an evidence node."""
+    from app.graph_state import get_node, get_edges_for_node
+
+    # Get the evidence node
+    node = get_node(evidence_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+
+    if node.case_id != case_id:
+        raise HTTPException(status_code=400, detail="Evidence does not belong to this case")
+
+    # Get all edges connected to this evidence
+    edges = get_edges_for_node(evidence_id)
+
+    inferences = []
+
+    # Build inference results for each connection
+    for edge in edges:
+        # Determine target node (could be source or target depending on edge direction)
+        target_id = edge.target_id if edge.source_id == evidence_id else edge.source_id
+        target_node = get_node(target_id)
+
+        if not target_node:
+            continue
+
+        # Extract edge metadata
+        edge_data = edge.data or {}
+        confidence = edge_data.get("confidence", 0.0)
+        temporal_score = edge_data.get("temporal_score", 0.0)
+        geo_score = edge_data.get("geo_score", 0.0)
+        semantic_score = edge_data.get("semantic_score", 0.0)
+
+        # Generate human-readable reasoning
+        reasoning = _generate_connection_reasoning(
+            edge.edge_type.value,
+            temporal_score,
+            geo_score,
+            semantic_score,
+            edge_data
+        )
+
+        # Extract target title
+        target_data = target_node.data or {}
+        target_title = (
+            target_data.get("title") or
+            target_data.get("text_body", "")[:50] or
+            target_node.node_type.value
+        )
+
+        inference = {
+            "type": edge.edge_type.value,
+            "target_id": target_id,
+            "target_title": target_title,
+            "confidence": confidence,
+            "reasoning": reasoning,
+            "components": {
+                "temporal_score": temporal_score,
+                "geo_score": geo_score,
+                "semantic_score": semantic_score,
+            },
+        }
+        inferences.append(inference)
+
+    # Get AI analysis from node data
+    node_data = node.data or {}
+    ai_analysis = node_data.get("ai_analysis", {})
+
+    return {
+        "evidence_id": evidence_id,
+        "inferences": inferences,
+        "ai_analysis": ai_analysis,
+    }
+
+
+def _generate_connection_reasoning(
+    edge_type: str,
+    temporal_score: float,
+    geo_score: float,
+    semantic_score: float,
+    edge_data: dict[str, Any],
+) -> str:
+    """Generate human-readable reasoning for why connection was made."""
+    if edge_type == "similar_to":
+        parts = []
+        if temporal_score > 0.7:
+            parts.append("reported within similar timeframe")
+        if geo_score > 0.7:
+            parts.append("geographically close")
+        if semantic_score > 0.7:
+            parts.append("semantically similar content")
+
+        if parts:
+            return "Evidence connected because: " + ", ".join(parts)
+        return "Evidence shows similarity patterns"
+
+    elif edge_type == "debunked_by":
+        return "Fact-check found claims in this evidence to be false"
+
+    elif edge_type == "contains":
+        return "Evidence contains related information"
+
+    elif edge_type == "repost_of":
+        return "Evidence appears to be a repost of the original content"
+
+    elif edge_type == "mutation_of":
+        return "Evidence shows signs of content manipulation or alteration"
+
+    elif edge_type == "amplified_by":
+        return "Evidence amplifies or spreads the original information"
+
+    # Manual connections
+    if edge_data.get("manual"):
+        notes = edge_data.get("notes", "")
+        return f"Manually connected by officer{': ' + notes if notes else ''}"
+
+    return "AI-generated connection"
+
+
 @router.post("/cases/{case_id}/edges")
 async def create_edge(
     case_id: str,
@@ -137,6 +296,21 @@ async def create_edge(
     session: Neo4jSession | None = Depends(GraphDatabase.get_optional_session),
 ):
     """Red String: link two nodes. Creates RELATED edge, emits edge:created for AI analysis."""
+    from app.graph_state import get_node
+
+    # Validate that both nodes exist
+    source_node = get_node(body.source_id)
+    target_node = get_node(body.target_id)
+
+    if not source_node:
+        raise HTTPException(status_code=404, detail=f"Source evidence not found: {body.source_id}")
+    if not target_node:
+        raise HTTPException(status_code=404, detail=f"Target evidence not found: {body.target_id}")
+
+    # Validate nodes belong to this case
+    if source_node.case_id != case_id or target_node.case_id != case_id:
+        raise HTTPException(status_code=400, detail="Evidence does not belong to this case")
+
     edge_data = {
         "source_id": body.source_id,
         "target_id": body.target_id,
@@ -161,8 +335,18 @@ async def create_edge(
     }
     edge_type = edge_type_map.get(type_lower, EdgeType.SIMILAR_TO)
 
-    # Add to in-memory graph state
-    edge = create_and_add_edge(edge_type, body.source_id, body.target_id, case_id, {"note": body.note or ""})
+    # Add to in-memory graph state with manual flag
+    edge = create_and_add_edge(
+        edge_type,
+        body.source_id,
+        body.target_id,
+        case_id,
+        {
+            "note": body.note or "",
+            "manual": True,  # Mark as manually created
+            "confidence": 1.0,  # Manual connections have 100% confidence
+        }
+    )
     await broadcast_graph_update("add_edge", edge.model_dump(mode="json"))
 
     # Emit event for AI analysis trigger
