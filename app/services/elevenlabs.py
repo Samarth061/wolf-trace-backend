@@ -27,10 +27,12 @@ async def text_to_speech(text: str, voice_id: Optional[str] = None) -> bytes | N
                     "Content-Type": "application/json",
                     "Accept": "audio/mpeg",
                 },
-                json={"text": text[:5000], "model_id": "eleven_monolingual_v1"},
+                json={"text": text[:5000], "model_id": "eleven_turbo_v2_5"},
             )
             if r.is_success:
                 return r.content
+            else:
+                logger.warning(f"ElevenLabs TTS failed with status {r.status_code}: {r.text}")
     except Exception as e:
         logger.warning("ElevenLabs TTS failed: %s", e)
     return None

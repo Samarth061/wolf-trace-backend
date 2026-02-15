@@ -135,6 +135,108 @@ async def synthesize_case(case_id: str, thread_ids: dict[str, str], case_context
     return {}
 
 
+async def generate_case_narrative(
+    timeline: list[dict[str, Any]],
+    connections: list[dict[str, Any]],
+    case_id: str = ""
+) -> str:
+    """Generate case narrative using GROQ (default) or Backboard fallback.
+
+    Args:
+        timeline: List of evidence nodes sorted by timestamp
+        connections: List of edges connecting evidence
+        case_id: Case identifier for Backboard fallback
+
+    Returns:
+        Structured narrative with Origin, Progression, and Current Status sections
+    """
+
+    # Build rich timeline context
+    timeline_context = []
+    for item in timeline:
+        data = item.get('data', {})
+        entry = f"- {item.get('timestamp', 'Unknown')}"
+
+        # Add title/content
+        title = data.get('title') or data.get('text_body', '')[:100]
+        entry += f": {title}"
+
+        # Add claims
+        claims = data.get('claims', [])
+        if claims:
+            claim_text = ', '.join(c.get('statement', '')[:50] for c in claims[:3])
+            entry += f" | Claims: {claim_text}"
+
+        # Add confidence/forensics
+        confidence = data.get('confidence', 0)
+        if confidence > 0:
+            entry += f" | Confidence: {int(confidence * 100)}%"
+
+        forensics = data.get('forensics', {})
+        if forensics.get('authenticity_score'):
+            entry += f" | Authenticity: {forensics['authenticity_score']:.0f}%"
+
+        timeline_context.append(entry)
+
+    # Build connection context with confidence
+    connection_context = []
+    for conn in connections[:20]:
+        edge_type = conn.get('edge_type', 'related')
+        if hasattr(edge_type, 'value'):
+            edge_type = edge_type.value
+        confidence = conn.get('data', {}).get('confidence', 0)
+        source = conn.get('source_id', 'unknown')
+        target = conn.get('target_id', 'unknown')
+
+        conn_str = f"- {source} → {edge_type} → {target}"
+        if confidence > 0:
+            conn_str += f" (confidence: {int(confidence * 100)}%)"
+        connection_context.append(conn_str)
+
+    # Create enhanced prompt
+    prompt = f"""Generate a coherent narrative for this investigation case.
+
+Evidence Timeline (chronological):
+{chr(10).join(timeline_context)}
+
+Evidence Connections:
+{chr(10).join(connection_context)}
+
+Generate a structured narrative with these sections:
+
+**Origin**: How the case started - identify earliest evidence and triggering event (1-2 sentences)
+
+**Progression**: How investigation evolved - evidence accumulation, patterns, verified/debunked claims (2-3 sentences)
+
+**Current Status**: Where case stands now - confidence level, verified vs suspicious evidence, uncertainties (1-2 sentences)
+
+Keep narrative factual, concise, and focused on evidence. Use confidence scores and forensic data when assessing credibility."""
+
+    # Primary: Use GROQ
+    if groq.is_available():
+        try:
+            logger.info("Routing generate_case_narrative to GROQ")
+            return await groq.generate_narrative(prompt)
+        except Exception as e:
+            logger.warning(f"GROQ failed, falling back to Backboard: {e}")
+
+    # Fallback: Backboard Case Synthesizer
+    if backboard_client.is_available() and case_id:
+        try:
+            threads = await backboard_client.create_case_thread(case_id)
+            tid = threads.get("case_synthesizer", "")
+            if tid:
+                resp = await backboard_client.send_to_agent("case_synthesizer", tid, prompt)
+                if resp:
+                    return resp.strip()
+        except Exception as e:
+            logger.warning("Backboard generate_case_narrative failed: %s", e)
+
+    # Mock fallback
+    logger.warning("All AI services unavailable, returning simple narrative")
+    return f"Case involves {len(timeline)} pieces of evidence. Evidence shows {len(connections)} connections. Manual review recommended."
+
+
 async def generate_search_queries(claims: list[dict[str, Any]], llm_provider: str = "groq") -> list[str]:
     """Generate search queries using GROQ (default) with mock fallback."""
 
